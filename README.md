@@ -35,6 +35,11 @@ This repository is a fork of the upstream [Turso Database](https://github.com/tu
 
 If you are re-mirroring this fork from a newer upstream release, see the fork's NQAF prompt history for the prompts that produced the current fixes, and re-apply them.
 
+### Fork Features
+
+* **Orphan-WAL policy.** `DatabaseOpts::with_orphan_wal_policy` takes an `OrphanWalPolicy`. The default, `Replay`, keeps upstream behaviour: a leftover `{db}-wal` beside an absent or empty db file is replayed, which brings the old database back on the first write that allocates page 1. `Discard { empty, read_only }` makes read-write opens truncate such an orphan WAL (and, per the `EmptyDb` rule, a 1-byte or invalid-header db file) to 0 bytes instead, and fsyncs page 1 and the db file's parent directory before the first WAL frame of a newly created db. Read-only opens never modify files; `read_only` chooses whether they ignore or replay the orphan WAL. Under experimental multiprocess WAL, `Discard` fails the open if another process is attached; registry-bypassed opens reject `Discard`.
+* **`IO::sync_parent_dir`**, the fork's first **IO extension** (see [`docs/adr/0001-io-extensions-are-required-trait-methods.md`](docs/adr/0001-io-extensions-are-required-trait-methods.md)). It is a required method on the `IO` trait, so out-of-tree `IO` impls must now implement it; impls that cannot honour it return `LimboError::IoExtensionUnsupported`, and `Discard` then refuses to create a db.
+
 ## About
 
 Turso Database is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations — see the [FAQ](#faq) for where the project stands on its way to 1.0.

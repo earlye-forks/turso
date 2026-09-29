@@ -46,10 +46,9 @@ impl IO for SparseLinuxIo {
         let parent = std::path::Path::new(path)
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."));
+            .unwrap_or_else(|| std::path::Path::new("."));
         let dir = std::fs::File::open(parent).map_err(|e| io_error(e, "open parent dir"))?;
-        dir.sync_all()
-            .map_err(|e| io_error(e, "sync parent dir"))?;
+        dir.sync_all().map_err(|e| io_error(e, "sync parent dir"))?;
         c.complete(0);
         Ok(c)
     }

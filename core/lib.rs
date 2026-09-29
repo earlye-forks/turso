@@ -30,11 +30,11 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub mod numeric;
 mod orphan_wal;
 #[cfg(all(test, feature = "fs", not(target_family = "wasm")))]
 mod orphan_wal_tests;
-#[cfg(any(feature = "fuzz", feature = "bench"))]
-pub mod numeric;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
@@ -1402,6 +1402,15 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
     ) -> Result<IOResult<Arc<Database>>> {
+        // Bypassed opens exist to put a second `Database` on a file another
+        // `Database` in this process may hold, and fcntl locks do not exclude
+        // the same process. That peer may be attached to the very WAL that
+        // `Discard` would truncate, so refuse rather than corrupt its view.
+        if matches!(opts.orphan_wal_policy, OrphanWalPolicy::Discard { .. }) {
+            return Err(LimboError::InvalidArgument(format!(
+                "OrphanWalPolicy::Discard is not supported for registry-bypassed opens of '{path}'"
+            )));
+        }
         let result = Self::open_with_flags_bypass_registry_async_internal(
             state,
             io,
@@ -1476,7 +1485,7 @@ impl Database {
                     state.phase = match opts.orphan_wal_policy {
                         OrphanWalPolicy::Replay => OpenDbAsyncPhase::ValidatingHeader,
                         OrphanWalPolicy::Discard { .. } => {
-                            state.orphan_wal_state = orphan_wal::OrphanWalState::default();
+                            state.orphan_wal_state = orphan_wal::OrphanWalState::new();
                             OpenDbAsyncPhase::ResolvingOrphanWal
                         }
                     };
@@ -1487,12 +1496,7 @@ impl Database {
                         .building_db
                         .as_mut()
                         .expect("building_db must be set in Init phase");
-                    // Only the registry excludes a second `Database` on the
-                    // same file within this process.
-                    let registry_protected = state.registry_key.is_some();
-                    return_if_io!(
-                        db.resolve_orphan_wal(&mut state.orphan_wal_state, registry_protected)
-                    );
+                    return_if_io!(db.resolve_orphan_wal(&mut state.orphan_wal_state));
                     state.phase = OpenDbAsyncPhase::ValidatingHeader;
                 }
 

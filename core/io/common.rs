@@ -7,7 +7,7 @@ fn parent_dir(path: &str) -> &std::path::Path {
     std::path::Path::new(path)
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."))
+        .unwrap_or_else(|| std::path::Path::new("."))
 }
 
 /// Fsync the parent directory of `path` so that its directory entry is
