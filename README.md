@@ -30,6 +30,12 @@
 
 ---
 
+## About This Fork
+
+This repository is a fork of the upstream [Turso Database](https://github.com/tursodatabase/turso) project. It carries a set of security and correctness fixes applied on top of upstream, tracked as prompts rather than as a diverging code history.
+
+If you are re-mirroring this fork from a newer upstream release, see the fork's NQAF prompt history for the prompts that produced the current fixes, and re-apply them.
+
 ## About
 
 Turso is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations.
