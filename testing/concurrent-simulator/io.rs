@@ -167,6 +167,12 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
+    /// Simulated files live in memory; there is no directory entry to sync.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     fn step(&self) -> Result<()> {
         // Complete any pending IO operations
         let mut pending = self.pending.lock().unwrap();

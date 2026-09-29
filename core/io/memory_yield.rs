@@ -94,6 +94,12 @@ impl IO for MemoryYieldIO {
         Ok(())
     }
 
+    /// Nothing in memory survives a crash, so there is nothing to make durable.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     fn file_id(&self, path: &str) -> Result<super::FileId> {
         Ok(super::FileId::from_path_hash(path))
     }
@@ -249,6 +255,10 @@ mod tests {
 
         fn remove_file(&self, path: &str) -> Result<()> {
             self.inner.remove_file(path)
+        }
+
+        fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+            self.inner.sync_parent_dir(path, c)
         }
 
         fn file_id(&self, path: &str) -> Result<super::super::FileId> {

@@ -40,6 +40,19 @@ impl IO for GenericIO {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+        // On unix, fsync the parent directory. Elsewhere there is no portable
+        // directory flush; see `WindowsIO::sync_parent_dir` for why that is
+        // sufficient on NTFS.
+        #[cfg(unix)]
+        crate::io::common::fsync_parent_dir(path)?;
+        #[cfg(not(unix))]
+        let _ = path;
+        c.complete(0);
+        Ok(c)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())
     }

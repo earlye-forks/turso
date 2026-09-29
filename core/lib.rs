@@ -30,6 +30,9 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
+mod orphan_wal;
+#[cfg(all(test, feature = "fs", not(target_family = "wasm")))]
+mod orphan_wal_tests;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
@@ -219,6 +222,47 @@ pub const fn is_attached_db(database_id: usize) -> bool {
     database_id >= FIRST_ATTACHED_DB_ID
 }
 
+/// What an open does with an orphan WAL: a nonempty `{db}-wal` beside a db
+/// file that holds no database.
+///
+/// Replaying such a WAL resurrects the old database as soon as page 1 is
+/// allocated. SQLite avoids this by deleting the WAL when the db has zero
+/// pages (`pagerOpenWalIfPresent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrphanWalPolicy {
+    /// Default. Upstream behaviour, unchanged.
+    #[default]
+    Replay,
+    /// Read-write opens discard an orphan WAL instead of replaying it.
+    Discard {
+        empty: EmptyDb,
+        read_only: ReadOnlyOrphanWal,
+    },
+}
+
+/// When a db file counts as holding no database under
+/// [`OrphanWalPolicy::Discard`]. Each rule includes the ones before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyDb {
+    /// The db file is absent or 0 bytes.
+    ZeroBytes,
+    /// Also a 1-byte file (SQLite's unix VFS reports a 1-byte file as 0 bytes).
+    OneByte,
+    /// Also any file whose page 1 is not a valid database header. Read-write
+    /// opens truncate such a file to 0 bytes, whether or not a WAL exists.
+    InvalidHeader,
+}
+
+/// What a read-only open does with an orphan WAL under
+/// [`OrphanWalPolicy::Discard`]. Read-only opens never modify any file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyOrphanWal {
+    /// Neither scan nor attach the WAL: the db reads as empty.
+    Ignore,
+    /// Replay the WAL, as upstream does.
+    Replay,
+}
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
@@ -233,6 +277,7 @@ pub struct DatabaseOpts {
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    pub orphan_wal_policy: OrphanWalPolicy,
     pub unsafe_testing: bool,
     enable_load_extension: bool,
 }
@@ -300,6 +345,11 @@ impl DatabaseOpts {
 
     pub fn with_without_rowid(mut self, enable: bool) -> Self {
         self.enable_without_rowid = enable;
+        self
+    }
+
+    pub fn with_orphan_wal_policy(mut self, policy: OrphanWalPolicy) -> Self {
+        self.orphan_wal_policy = policy;
         self
     }
 
@@ -407,6 +457,9 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 pub enum OpenDbAsyncPhase {
     #[default]
     Init,
+    /// Drives `Database::resolve_orphan_wal` under `OrphanWalPolicy::Discard`,
+    /// before anything reads the db header or scans the WAL.
+    ResolvingOrphanWal,
     /// Drives `Database::header_validation` (header validation + WAL recovery)
     /// as a sub state machine so WAL recovery on open does not block.
     ValidatingHeader,
@@ -506,6 +559,8 @@ pub struct OpenDbAsyncState {
     building_db: Option<Database>,
     /// Sub state machine for `header_validation`, driven in ValidatingHeader.
     header_validation_state: HeaderValidationState,
+    /// Sub state machine for `resolve_orphan_wal`, driven in ResolvingOrphanWal.
+    orphan_wal_state: orphan_wal::OrphanWalState,
     /// The dedicated bootstrap connection used by `BootstrapMvStore`, held
     /// across yields from `MvStore::bootstrap_nonblock`.
     mvcc_bootstrap_conn: Option<Arc<Connection>>,
@@ -533,6 +588,7 @@ impl OpenDbAsyncState {
             registry_key: None,
             building_db: None,
             header_validation_state: HeaderValidationState::default(),
+            orphan_wal_state: orphan_wal::OrphanWalState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
         }
@@ -630,6 +686,16 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+
+    /// Set by [`OrphanWalPolicy::Discard`] with [`ReadOnlyOrphanWal::Ignore`]
+    /// when a read-only open finds an empty db: the WAL is neither scanned nor
+    /// attached.
+    orphan_wal_ignored: bool,
+    /// Set by a read-write [`OrphanWalPolicy::Discard`] open that finds an
+    /// empty db, i.e. this `Database` creates the database. `allocate_page1`
+    /// then makes page 1 and the db file's directory entry durable before the
+    /// first WAL frame is written.
+    creates_db_file: bool,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -765,6 +831,9 @@ impl Database {
             ),
 
             durable_storage: None,
+
+            orphan_wal_ignored: false,
+            creates_db_file: false,
         };
 
         db.register_global_builtin_extensions()
@@ -1404,6 +1473,26 @@ impl Database {
                     state.building_db = Some(db);
                     state.encryption_key = encryption_key;
                     state.header_validation_state = HeaderValidationState::default();
+                    state.phase = match opts.orphan_wal_policy {
+                        OrphanWalPolicy::Replay => OpenDbAsyncPhase::ValidatingHeader,
+                        OrphanWalPolicy::Discard { .. } => {
+                            state.orphan_wal_state = orphan_wal::OrphanWalState::default();
+                            OpenDbAsyncPhase::ResolvingOrphanWal
+                        }
+                    };
+                }
+
+                OpenDbAsyncPhase::ResolvingOrphanWal => {
+                    let db = state
+                        .building_db
+                        .as_mut()
+                        .expect("building_db must be set in Init phase");
+                    // Only the registry excludes a second `Database` on the
+                    // same file within this process.
+                    let registry_protected = state.registry_key.is_some();
+                    return_if_io!(
+                        db.resolve_orphan_wal(&mut state.orphan_wal_state, registry_protected)
+                    );
                     state.phase = OpenDbAsyncPhase::ValidatingHeader;
                 }
 
@@ -1956,7 +2045,11 @@ impl Database {
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
-                    let shared_wal = {
+                    let shared_wal = if self.orphan_wal_ignored {
+                        // Read-only open under `ReadOnlyOrphanWal::Ignore`:
+                        // leave the orphan WAL unscanned and unattached.
+                        WalFileShared::new_noop()
+                    } else {
                         #[cfg(not(host_shared_wal))]
                         {
                             if driver.is_none() {
@@ -2777,7 +2870,7 @@ impl Database {
             None
         };
 
-        let pager = Pager::new(
+        let mut pager = Pager::new(
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
@@ -2786,6 +2879,11 @@ impl Database {
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;
+        if self.creates_db_file {
+            pager.set_page1_durability(pager::Page1Durability {
+                parent_dir_path: self.path.clone(),
+            });
+        }
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);

@@ -42,6 +42,19 @@ impl IO for SparseLinuxIo {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let dir = std::fs::File::open(parent).map_err(|e| io_error(e, "open parent dir"))?;
+        dir.sync_all()
+            .map_err(|e| io_error(e, "sync parent dir"))?;
+        c.complete(0);
+        Ok(c)
+    }
+
+    #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())
     }
