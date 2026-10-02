@@ -1,5 +1,25 @@
 pub const ENV_DISABLE_FILE_LOCK: &str = "LIMBO_DISABLE_FILE_LOCK";
 
+/// Returns the parent directory of `path`. The parent of a bare filename is
+/// the current directory.
+#[cfg(unix)]
+fn parent_dir(path: &str) -> &std::path::Path {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+/// Fsync the parent directory of `path` so that its directory entry is
+/// durable. Shared by the POSIX `IO::sync_parent_dir` impls.
+#[cfg(unix)]
+pub(crate) fn fsync_parent_dir(path: &str) -> crate::Result<()> {
+    let dir = std::fs::File::open(parent_dir(path))
+        .map_err(|e| crate::error::io_error(e, "open parent dir"))?;
+    dir.sync_all()
+        .map_err(|e| crate::error::io_error(e, "sync parent dir"))
+}
+
 #[cfg(test)]
 pub mod tests {
     use crate::{Result, IO};

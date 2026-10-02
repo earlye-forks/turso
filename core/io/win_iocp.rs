@@ -369,6 +369,12 @@ impl IO for WindowsIOCP {
         std::fs::remove_file(file_path).map_err(|e| io_error(e, "remove-file"))
     }
 
+    /// No-op on NTFS; see `WindowsIO::sync_parent_dir` for the reasoning.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         for cmpl in completions {

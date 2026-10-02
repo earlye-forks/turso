@@ -111,6 +111,11 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    /// The active IO backend does not implement a required IO extension
+    /// (the payload names the `IO` method). Features that depend on the
+    /// extension refuse to run rather than fall back to a weaker guarantee.
+    #[error("IO extension not supported by the active IO backend: {0}")]
+    IoExtensionUnsupported(&'static str),
 }
 
 impl From<crate::alloc::AllocError> for LimboError {

@@ -1391,6 +1391,9 @@ pub struct Pager {
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    /// Set under `OrphanWalPolicy::Discard`: `allocate_page1` makes page 1
+    /// durable before any WAL frame can be written.
+    page1_durability: Option<Page1Durability>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
@@ -1533,8 +1536,31 @@ enum AllocatePageState {
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
-    Writing { page: PageRef },
+    Writing {
+        page: PageRef,
+    },
+    /// Waiting for the db file fsync after page 1 was written.
+    SyncingDb {
+        page: PageRef,
+        completion: Completion,
+    },
+    /// Waiting for the parent directory fsync of a newly created db file.
+    SyncingParentDir {
+        page: PageRef,
+        completion: Completion,
+    },
     Done,
+}
+
+/// Makes page 1 durable before the first WAL frame is written, so that a WAL
+/// holding committed frames is never left beside a db file that counts as
+/// empty. Set on a pager by `OrphanWalPolicy::Discard` opens that create the
+/// database; otherwise `Discard` could throw such a WAL away after a crash.
+#[derive(Debug, Clone)]
+pub(crate) struct Page1Durability {
+    /// Path of the db file whose directory entry must be made durable with
+    /// `IO::sync_parent_dir` after page 1 is synced.
+    pub parent_dir_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1676,6 +1702,7 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
+            page1_durability: None,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
@@ -1765,6 +1792,10 @@ impl Pager {
             // SAFETY: see RegisteredCursor's invariant.
             unsafe { peer.as_mut().invalidate_btree_cache() };
         }
+    }
+
+    pub(crate) fn set_page1_durability(&mut self, durability: Page1Durability) {
+        self.page1_durability = Some(durability);
     }
 
     /// Get the sync type setting.
@@ -5241,25 +5272,84 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                let page_key = PageCacheKey::new(page.get().id);
-                let mut cache = self.page_cache.write();
-                cache.insert(page_key, page.clone()).map_err(|e| {
-                    LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
-                })?;
-                // After we wrote the header page, we may now set this None, to signify we initialized
-                self.init_page_1.store(None);
-                page.unpin();
-                *self.allocate_page1_state.write() = AllocatePage1State::Done;
-                Ok(IOResult::Done(page))
+                if self.page1_durability.is_some() {
+                    let c = self.db_file.sync(
+                        Completion::new_sync(|_| {
+                            tracing::trace!("allocate_page1: db file synced");
+                        }),
+                        self.get_sync_type(),
+                    )?;
+                    *self.allocate_page1_state.write() = AllocatePage1State::SyncingDb {
+                        page,
+                        completion: c.clone(),
+                    };
+                    io_yield_one!(c);
+                }
+                self.finish_allocate_page1(page)
+            }
+            AllocatePage1State::SyncingDb { page, completion } => {
+                if let Some(err) = completion.get_error() {
+                    return Err(self.fail_allocate_page1(&page, err));
+                }
+                if !completion.finished() {
+                    io_yield_one!(completion);
+                }
+                let durability = self
+                    .page1_durability
+                    .as_ref()
+                    .expect("SyncingDb is only entered with page1_durability set");
+                let c = self.io.sync_parent_dir(
+                    &durability.parent_dir_path,
+                    Completion::new_sync(|_| {
+                        tracing::trace!("allocate_page1: db parent directory synced");
+                    }),
+                )?;
+                *self.allocate_page1_state.write() = AllocatePage1State::SyncingParentDir {
+                    page,
+                    completion: c.clone(),
+                };
+                io_yield_one!(c);
+            }
+            AllocatePage1State::SyncingParentDir { page, completion } => {
+                if let Some(err) = completion.get_error() {
+                    return Err(self.fail_allocate_page1(&page, err));
+                }
+                if !completion.finished() {
+                    io_yield_one!(completion);
+                }
+                self.finish_allocate_page1(page)
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
+    }
+
+    fn finish_allocate_page1(&self, page: PageRef) -> Result<IOResult<PageRef>> {
+        let page_key = PageCacheKey::new(page.get().id);
+        let mut cache = self.page_cache.write();
+        cache.insert(page_key, page.clone()).map_err(|e| {
+            LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
+        })?;
+        // After we wrote the header page, we may now set this None, to signify we initialized
+        self.init_page_1.store(None);
+        page.unpin();
+        *self.allocate_page1_state.write() = AllocatePage1State::Done;
+        Ok(IOResult::Done(page))
+    }
+
+    /// A page-1 durability sync failed: page 1 is still not durable, so the db
+    /// stays uninitialized and the next attempt rewrites and resyncs it.
+    fn fail_allocate_page1(&self, page: &PageRef, err: CompletionError) -> LimboError {
+        page.unpin();
+        *self.allocate_page1_state.write() = AllocatePage1State::Start;
+        err.into()
     }
 
     pub fn allocating_page1(&self) -> bool {
         matches!(
             *self.allocate_page1_state.read(),
             AllocatePage1State::Writing { .. }
+                | AllocatePage1State::SyncingDb { .. }
+                | AllocatePage1State::SyncingParentDir { .. }
         )
     }
 

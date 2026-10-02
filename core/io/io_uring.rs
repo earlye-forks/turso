@@ -473,6 +473,15 @@ impl IO for UringIO {
         Ok(())
     }
 
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+        // A directory fsync is rare (once per db creation), so do it
+        // synchronously rather than through the ring.
+        common::fsync_parent_dir(path)?;
+        trace!("fsync parent dir of {path}");
+        c.complete(0);
+        Ok(c)
+    }
+
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         let mut state = self.state.lock();
         for c in completions {

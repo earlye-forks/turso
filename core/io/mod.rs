@@ -373,6 +373,16 @@ pub trait IO: Clock + Send + Sync {
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
 
+    /// Make the directory entry for `path` durable by fsyncing its parent
+    /// directory. Returns an unsupported error if this IO cannot provide that.
+    ///
+    /// This is an IO extension (see
+    /// `docs/adr/0001-io-extensions-are-required-trait-methods.md`): it is
+    /// required so that every impl decides what it means for it. Impls that
+    /// cannot honour it return [`crate::LimboError::IoExtensionUnsupported`].
+    /// Synchronous impls may complete `c` before returning.
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion>;
+
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {
         false

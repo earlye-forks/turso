@@ -331,6 +331,24 @@ impl IO for WindowsIO {
         Ok(())
     }
 
+    /// No-op: NTFS needs no separate directory flush for a new file's entry.
+    ///
+    /// Windows has no documented API to flush a directory entry (there is no
+    /// equivalent of POSIX `fsync(dirfd)`), and NTFS does not need one. File
+    /// creation, including the insert into the parent directory's index, is a
+    /// metadata operation that NTFS records in its `$LogFile` journal.
+    /// `FlushFileBuffers` on the file's own handle flushes that journal up to
+    /// the file's latest change, which covers the earlier create. The only
+    /// caller (`allocate_page1` under `OrphanWalPolicy::Discard`) fsyncs the db
+    /// file before calling this, so the directory entry is already durable.
+    /// SQLite's `os_win.c` has no directory sync, and RocksDB's
+    /// `WinDirectory::Fsync` is a no-op, for the same reason. Non-journaling
+    /// file systems (FAT/exFAT) are not covered, as with SQLite.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())

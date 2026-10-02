@@ -5,7 +5,9 @@ use std::{
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, PlatformIO, Result, WallClockInstant};
+use turso_core::{
+    Clock, Completion, IO, MonotonicInstant, OpenFlags, PlatformIO, Result, WallClockInstant,
+};
 
 use crate::runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile};
 
@@ -153,6 +155,10 @@ impl IO for SimulatorIO {
     fn remove_file(&self, path: &str) -> Result<()> {
         self.files.borrow_mut().retain(|x| x.path != path);
         Ok(())
+    }
+
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+        self.inner.sync_parent_dir(path, c)
     }
 
     fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {

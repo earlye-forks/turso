@@ -401,6 +401,7 @@ mod tests {
                 enable_multiprocess_wal: false,
                 enable_without_rowid: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
+                orphan_wal_policy: crate::OrphanWalPolicy::Replay,
                 unsafe_testing: false,
             },
             None,

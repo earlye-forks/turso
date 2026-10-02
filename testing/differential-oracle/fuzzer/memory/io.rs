@@ -6,7 +6,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
+use turso_core::{Clock, Completion, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
 
 use crate::memory::file::MemorySimFile;
 
@@ -127,6 +127,12 @@ impl IO for MemorySimIO {
     fn remove_file(&self, path: &str) -> Result<()> {
         self.files.borrow_mut().shift_remove(path);
         Ok(())
+    }
+
+    /// Files live in memory; there is no directory entry to sync.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
     }
 
     fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {

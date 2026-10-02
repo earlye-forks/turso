@@ -63,6 +63,13 @@ impl IO for TestIo {
     fn remove_file(&self, path: &str) -> turso_core::Result<()> {
         self.io.remove_file(path)
     }
+    fn sync_parent_dir(
+        &self,
+        path: &str,
+        c: turso_core::Completion,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.io.sync_parent_dir(path, c)
+    }
     fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
         self.io.file_id(path)
     }
