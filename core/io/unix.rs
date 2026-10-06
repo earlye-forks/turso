@@ -77,6 +77,12 @@ impl IO for UnixIO {
         Ok(())
     }
 
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+        common::fsync_parent_dir(path).map_err(|e| io_error(e, "sync_parent_dir"))?;
+        c.complete(0);
+        Ok(c)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())

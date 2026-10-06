@@ -1578,6 +1578,7 @@ pub struct SharedPagerState {
     init_lock: Mutex<()>,
     init_page_1: ArcSwapOption<Page>,
     page_size: AtomicU32,
+    parent_dir_to_sync_after_page1: Option<String>,
 }
 
 impl SharedPagerState {
@@ -1592,7 +1593,13 @@ impl SharedPagerState {
             init_lock: Mutex::new(()),
             init_page_1: ArcSwapOption::new(init_page_1),
             page_size: AtomicU32::new(page_size),
+            parent_dir_to_sync_after_page1: None,
         }
+    }
+
+    pub(crate) fn sync_parent_dir_after_page1(mut self, db_path: String) -> Self {
+        self.parent_dir_to_sync_after_page1 = Some(db_path);
+        self
     }
 
     pub(crate) fn initialized(&self) -> bool {
@@ -1830,6 +1837,9 @@ enum AllocatePage1State {
     /// Fsyncing the freshly written page 1 to the main database file, so a
     /// WAL can never exist next to an empty (0-byte on disk) database file.
     Syncing {
+        page: PageRef,
+    },
+    SyncingParentDir {
         page: PageRef,
     },
     Done,
@@ -5730,7 +5740,7 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done)");
-                if self.wal.is_some() {
+                if self.wal.is_some() || self.shared.parent_dir_to_sync_after_page1.is_some() {
                     // Fsync page 1 to the main database file before any commit
                     // can fsync frames into the WAL. This keeps the invariant
                     // "a WAL exists ⇒ the database file has at least one page"
@@ -5752,6 +5762,18 @@ impl Pager {
             }
             AllocatePage1State::Syncing { page } => {
                 tracing::trace!("allocate_page1(Syncing done)");
+                if let Some(db_path) = &self.shared.parent_dir_to_sync_after_page1 {
+                    let c = self
+                        .io
+                        .sync_parent_dir(db_path, Completion::new_sync(|_| {}))?;
+                    *self.allocate_page1_state.write() =
+                        AllocatePage1State::SyncingParentDir { page };
+                    io_yield_one!(c);
+                }
+                self.finish_allocate_page1(page)
+            }
+            AllocatePage1State::SyncingParentDir { page } => {
+                tracing::trace!("allocate_page1(SyncingParentDir done)");
                 self.finish_allocate_page1(page)
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
@@ -5777,7 +5799,9 @@ impl Pager {
     pub fn allocating_page1(&self) -> bool {
         matches!(
             *self.allocate_page1_state.read(),
-            AllocatePage1State::Writing { .. } | AllocatePage1State::Syncing { .. }
+            AllocatePage1State::Writing { .. }
+                | AllocatePage1State::Syncing { .. }
+                | AllocatePage1State::SyncingParentDir { .. }
         )
     }
 

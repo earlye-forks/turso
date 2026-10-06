@@ -91,6 +91,9 @@ impl IO for SyncCountingIo {
     fn remove_file(&self, path: &str) -> Result<()> {
         self.inner.remove_file(path)
     }
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
+        self.inner.sync_parent_dir(path, c)
+    }
     fn file_id(&self, path: &str) -> Result<FileId> {
         self.inner.file_id(path)
     }

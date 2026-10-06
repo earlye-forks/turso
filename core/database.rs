@@ -80,6 +80,7 @@ pub struct DatabaseOpts {
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    pub orphan_wal_policy: OrphanWalPolicy,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -150,10 +151,40 @@ impl DatabaseOpts {
         self
     }
 
+    pub fn with_orphan_wal_policy(mut self, policy: OrphanWalPolicy) -> Self {
+        self.orphan_wal_policy = policy;
+        self
+    }
+
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
         self
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OrphanWalPolicy {
+    /// Default. Upstream behaviour, unchanged.
+    #[default]
+    Replay,
+    /// Read-write opens discard an orphan WAL instead of replaying it.
+    Discard {
+        empty: EmptyDb,
+        read_only: ReadOnlyOrphanWal,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EmptyDb {
+    ZeroBytes,
+    OneByte,
+    InvalidHeader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyOrphanWal {
+    Ignore,
+    Replay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +439,7 @@ pub(crate) enum InitState {
 /// [`OpenDbAsyncPhase::ValidatingHeader`]. Keeps WAL recovery on open
 /// non-blocking by yielding through its IO instead of `io.block`.
 enum HeaderValidationState {
+    CheckOrphanWal(OrphanWalCheckState),
     Start {
         init: InitState,
     },
@@ -446,10 +478,45 @@ enum HeaderValidationState {
 
 impl Default for HeaderValidationState {
     fn default() -> Self {
-        Self::Start {
-            init: InitState::default(),
-        }
+        Self::CheckOrphanWal(OrphanWalCheckState::Start)
     }
+}
+
+enum OrphanWalCheckState {
+    Start,
+    ReadingHeader {
+        header: DbHeaderReadState,
+        db_len: u64,
+    },
+    ProbingParentDirSync {
+        empty_db: EmptyDbFile,
+        db_len: u64,
+        completion: Completion,
+    },
+    TruncatingDb {
+        wal: Arc<dyn io::File>,
+        completion: Completion,
+    },
+    SyncingDb {
+        wal: Arc<dyn io::File>,
+        completion: Completion,
+    },
+    TruncatingWal {
+        wal: Arc<dyn io::File>,
+        completion: Completion,
+    },
+    SyncingWal {
+        #[allow(dead_code, reason = "keeps the WAL file open until its sync finishes")]
+        wal: Arc<dyn io::File>,
+        completion: Completion,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyDbFile {
+    ZeroBytes,
+    OneByte,
+    InvalidHeader,
 }
 
 /// How `Database::_connect` loads the connection's ANALYZE stats.
@@ -1371,6 +1438,7 @@ impl Database {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn do_open(io: Arc<dyn IO>, path: &str, mut options: OpenOptions) -> Result<Arc<Database>> {
         Self::validate_open_options(&options)?;
+        Self::reject_orphan_wal_discard_for_registry_bypass(path, &options)?;
         if options.storage.is_none() {
             // `use_registry = false`: the raw path never consults the registry,
             // so this only opens the file and never returns a cached Database.
@@ -1399,6 +1467,7 @@ impl Database {
         options: &OpenOptions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_open_options(options)?;
+        Self::reject_orphan_wal_discard_for_registry_bypass(path, options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::storage is required for Database::do_open_async".to_string(),
@@ -1420,6 +1489,18 @@ impl Database {
             options.dialect.clone(),
             &options.native_extensions,
         )
+    }
+
+    fn reject_orphan_wal_discard_for_registry_bypass(
+        path: &str,
+        options: &OpenOptions,
+    ) -> Result<()> {
+        if let OrphanWalPolicy::Discard { .. } = options.db_opts.orphan_wal_policy {
+            return Err(LimboError::InvalidArgument(format!(
+                "cannot open '{path}' with OrphanWalPolicy::Discard through Database::do_open/do_open_async: these opens skip the process-wide registry, so another Database in this process may be using the same files"
+            )));
+        }
+        Ok(())
     }
 
     /// Run the open state machine and release the schema guard if it fails.
@@ -1900,6 +1981,15 @@ impl Database {
     ) -> IOResultOr<Arc<Pager>> {
         loop {
             match st {
+                HeaderValidationState::CheckOrphanWal(check) => {
+                    let encrypted = encryption_key.is_some()
+                        || page_codec.is_some()
+                        || !matches!(self.encryption_cipher_mode.get(), CipherMode::None);
+                    return_if_io!(self.check_orphan_wal(check, encrypted));
+                    *st = HeaderValidationState::Start {
+                        init: InitState::default(),
+                    };
+                }
                 HeaderValidationState::Start { init } => {
                     // `_init` does not modify `open_flags` (the autovacuum
                     // override happens later in `Validate`), so capturing
@@ -2157,7 +2247,9 @@ impl Database {
                 } => {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
-                    let mut shared_wal = {
+                    let mut shared_wal = if self.ignores_orphan_wal() {
+                        WalFileShared::new_noop()
+                    } else {
                         #[cfg(not(host_shared_wal))]
                         {
                             if driver.is_none() {
@@ -2287,6 +2379,239 @@ impl Database {
                 }
             }
         }
+    }
+
+    fn check_orphan_wal(
+        &mut self,
+        st: &mut OrphanWalCheckState,
+        encrypted: bool,
+    ) -> IOResultOr<()> {
+        let OrphanWalPolicy::Discard { empty, read_only } = self.opts.orphan_wal_policy else {
+            return Ok(IOResult::Done(()));
+        };
+        loop {
+            match st {
+                OrphanWalCheckState::Start => {
+                    if is_memory_like(&self.path) {
+                        return Ok(IOResult::Done(()));
+                    }
+                    let db_len = self.db_file.size()?;
+                    let empty_db = match db_len {
+                        0 => Some(EmptyDbFile::ZeroBytes),
+                        _ if empty == EmptyDb::InvalidHeader && !encrypted => {
+                            if db_len >= PageSize::MIN as u64 {
+                                *st = OrphanWalCheckState::ReadingHeader {
+                                    header: DbHeaderReadState::default(),
+                                    db_len,
+                                };
+                                continue;
+                            }
+                            Some(EmptyDbFile::InvalidHeader)
+                        }
+                        1 if empty >= EmptyDb::OneByte => Some(EmptyDbFile::OneByte),
+                        _ => None,
+                    };
+                    let Some(empty_db) = empty_db else {
+                        return self.found_database();
+                    };
+                    if self.open_flags.contains(OpenFlags::ReadOnly) {
+                        return self.open_empty_db_read_only(empty_db, read_only);
+                    }
+                    *st = self.probe_parent_dir_sync(empty_db, db_len)?;
+                }
+                OrphanWalCheckState::ReadingHeader { header, db_len } => {
+                    let db_len = *db_len;
+                    let header = return_if_io!(self.read_db_header_buf(header));
+                    if holds_valid_database_header(header.bytes()) {
+                        return self.found_database();
+                    }
+                    if self.open_flags.contains(OpenFlags::ReadOnly) {
+                        return self.open_empty_db_read_only(EmptyDbFile::InvalidHeader, read_only);
+                    }
+                    *st = self.probe_parent_dir_sync(EmptyDbFile::InvalidHeader, db_len)?;
+                }
+                OrphanWalCheckState::ProbingParentDirSync {
+                    empty_db,
+                    db_len,
+                    completion,
+                } => {
+                    if !completion_succeeded(completion)? {
+                        io_yield_one!(completion.clone());
+                    }
+                    if self.db_file.size()? != *db_len {
+                        *st = OrphanWalCheckState::Start;
+                        continue;
+                    }
+                    let empty_db = *empty_db;
+                    let wal = self.io.open_file(&self.wal_path, self.open_flags, false)?;
+                    let wal_len = wal.size()?;
+                    if empty_db == EmptyDbFile::ZeroBytes && wal_len == 0 {
+                        return self.install_empty_page1(true);
+                    }
+                    self.reject_orphan_wal_discard_with_attached_peer()?;
+                    if empty_db == EmptyDbFile::ZeroBytes {
+                        let completion = wal.truncate(0, Completion::new_trunc(|_| {}))?;
+                        *st = OrphanWalCheckState::TruncatingWal { wal, completion };
+                        continue;
+                    }
+                    tracing::warn!(
+                        "truncating database file '{}': it holds no database under the orphan WAL policy",
+                        self.path
+                    );
+                    let completion = self.db_file.truncate(0, Completion::new_trunc(|_| {}))?;
+                    *st = OrphanWalCheckState::TruncatingDb { wal, completion };
+                }
+                OrphanWalCheckState::TruncatingDb { wal, completion } => {
+                    if !completion_succeeded(completion)? {
+                        io_yield_one!(completion.clone());
+                    }
+                    let completion = self
+                        .db_file
+                        .sync(Completion::new_sync(|_| {}), io::FileSyncType::Fsync)?;
+                    *st = OrphanWalCheckState::SyncingDb {
+                        wal: wal.clone(),
+                        completion,
+                    };
+                }
+                OrphanWalCheckState::SyncingDb { wal, completion } => {
+                    if !completion_succeeded(completion)? {
+                        io_yield_one!(completion.clone());
+                    }
+                    if wal.size()? == 0 {
+                        return self.install_empty_page1(true);
+                    }
+                    let completion = wal.truncate(0, Completion::new_trunc(|_| {}))?;
+                    *st = OrphanWalCheckState::TruncatingWal {
+                        wal: wal.clone(),
+                        completion,
+                    };
+                }
+                OrphanWalCheckState::TruncatingWal { wal, completion } => {
+                    if !completion_succeeded(completion)? {
+                        io_yield_one!(completion.clone());
+                    }
+                    tracing::warn!(
+                        "discarded WAL '{}': database file '{}' holds no database",
+                        self.wal_path,
+                        self.path
+                    );
+                    let completion =
+                        wal.sync(Completion::new_sync(|_| {}), io::FileSyncType::Fsync)?;
+                    *st = OrphanWalCheckState::SyncingWal {
+                        wal: wal.clone(),
+                        completion,
+                    };
+                }
+                OrphanWalCheckState::SyncingWal { completion, .. } => {
+                    if !completion_succeeded(completion)? {
+                        io_yield_one!(completion.clone());
+                    }
+                    return self.install_empty_page1(true);
+                }
+            }
+        }
+    }
+
+    fn found_database(&mut self) -> IOResultOr<()> {
+        if !self.pager_state.initialized() {
+            self.replace_pager_state(SharedPagerState::new(None));
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    fn open_empty_db_read_only(
+        &mut self,
+        empty_db: EmptyDbFile,
+        read_only: ReadOnlyOrphanWal,
+    ) -> IOResultOr<()> {
+        match (empty_db, read_only) {
+            (EmptyDbFile::InvalidHeader, _) => Err(LimboError::Corrupt(format!(
+                "database file '{}' does not hold a valid database header, and a read-only open cannot discard it",
+                self.path
+            ))
+            .into()),
+            (EmptyDbFile::OneByte, ReadOnlyOrphanWal::Ignore) => self.install_empty_page1(false),
+            (EmptyDbFile::ZeroBytes, _) | (EmptyDbFile::OneByte, ReadOnlyOrphanWal::Replay) => {
+                Ok(IOResult::Done(()))
+            }
+        }
+    }
+
+    fn probe_parent_dir_sync(
+        &self,
+        empty_db: EmptyDbFile,
+        db_len: u64,
+    ) -> Result<OrphanWalCheckState> {
+        let completion = match self
+            .io
+            .sync_parent_dir(&self.path, Completion::new_sync(|_| {}))
+        {
+            Err(LimboError::IoExtensionUnsupported(method)) => {
+                return Err(LimboError::InvalidArgument(format!(
+                    "cannot open '{}' with OrphanWalPolicy::Discard: the IO backend does not support IO::{method}, which is needed to make a new database file durable",
+                    self.path
+                )));
+            }
+            result => result?,
+        };
+        Ok(OrphanWalCheckState::ProbingParentDirSync {
+            empty_db,
+            db_len,
+            completion,
+        })
+    }
+
+    fn install_empty_page1(&mut self, sync_parent_dir_after_page1: bool) -> IOResultOr<()> {
+        let cipher = self.encryption_cipher_mode.get();
+        let cipher = (!matches!(cipher, CipherMode::None)).then_some(cipher);
+        let mut pager_state = SharedPagerState::new(Some(pager::default_page1(cipher.as_ref())));
+        if sync_parent_dir_after_page1 {
+            pager_state = pager_state.sync_parent_dir_after_page1(self.path.clone());
+        }
+        self.replace_pager_state(pager_state);
+        Ok(IOResult::Done(()))
+    }
+
+    fn replace_pager_state(&mut self, pager_state: SharedPagerState) {
+        turso_assert!(
+            Arc::strong_count(&self.pager_state) == 1,
+            "pager state must not be shared before the orphan WAL check"
+        );
+        self.pager_state = Arc::new(pager_state);
+    }
+
+    #[cfg(host_shared_wal)]
+    fn reject_orphan_wal_discard_with_attached_peer(&self) -> Result<()> {
+        let Some(authority) = self.open_shared_wal_coordination_for_open()? else {
+            return Ok(());
+        };
+        if authority.open_mode()
+            == storage::shared_wal_coordination::SharedWalCoordinationOpenMode::MultiProcess
+        {
+            return Err(LimboError::LockingError(format!(
+                "cannot discard orphan WAL '{}' beside empty database file '{}': another process is attached to the database through '{}'",
+                self.wal_path,
+                self.path,
+                storage::wal::coordination_path_for_wal_path(&self.wal_path)
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(host_shared_wal))]
+    fn reject_orphan_wal_discard_with_attached_peer(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn ignores_orphan_wal(&self) -> bool {
+        matches!(
+            self.opts.orphan_wal_policy,
+            OrphanWalPolicy::Discard {
+                read_only: ReadOnlyOrphanWal::Ignore,
+                ..
+            }
+        ) && self.open_flags.contains(OpenFlags::ReadOnly)
+            && !self.pager_state.initialized()
     }
 
     pub fn get_database_canonical_path(&self) -> String {
@@ -3454,6 +3779,37 @@ impl Database {
     pub fn get_pending_byte() -> u32 {
         Pager::get_pending_byte()
     }
+}
+
+fn completion_succeeded(completion: &Completion) -> Result<bool> {
+    if let Some(err) = completion.get_error() {
+        return Err(err.into());
+    }
+    Ok(completion.succeeded())
+}
+
+fn holds_valid_database_header(bytes: &[u8]) -> bool {
+    if bytes.starts_with(TURSO_HEADER_PREFIX) {
+        return true;
+    }
+    let Some(header_bytes) = bytes.get(..DatabaseHeader::SIZE) else {
+        return false;
+    };
+    let header: &DatabaseHeader = bytemuck::from_bytes(header_bytes);
+    header.magic == SQLITE_HEADER
+        && PageSize::new_from_header_u16(header.page_size.get_raw()).is_ok()
+        && header.max_embed_frac == 64
+        && header.min_embed_frac == 32
+        && header.leaf_frac == 32
+        && header.schema_format.get() <= 4
+        && matches!(
+            header.text_encoding,
+            TextEncoding::Unset
+                | TextEncoding::Utf8
+                | TextEncoding::Utf16Le
+                | TextEncoding::Utf16Be
+        )
+        && header_bytes[72..92].iter().all(|byte| *byte == 0)
 }
 
 pub(crate) struct AttachedDatabase {

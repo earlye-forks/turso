@@ -36,6 +36,11 @@ This repository is a fork of the upstream [Turso Database](https://github.com/tu
 
 If you are re-mirroring this fork from a newer upstream release, see the fork's NQAF prompt history for the prompts that produced the current fixes, and re-apply them.
 
+### Fork Features
+
+* **Orphan-WAL policy.** `DatabaseOpts::with_orphan_wal_policy` takes an `OrphanWalPolicy`. The default, `Replay`, keeps upstream behaviour. `Discard { empty, read_only }` makes a read-write open throw away a leftover `-wal` that sits beside a database file holding no database (absent or 0 bytes; optionally also 1 byte, or any file without a valid page-1 header), by truncating it to 0 bytes through the supplied `IO`, instead of letting it bring an old database back. Read-only opens never modify files: they either ignore the WAL or replay it as upstream does, and fail on an invalid header. In multiprocess WAL mode the open fails rather than discard while another process is attached. Under `Discard`, page 1 of a new database is fsynced, and its parent directory synced, before the first WAL frame is written. Under `Discard`, opens that bypass the in-process registry (`Database::do_open`/`do_open_async`) fail, so the sync engine, which reopens databases through that path, cannot be combined with `Discard`.
+* **`IO::sync_parent_dir`** is a new required method on the `IO` trait (an **IO extension**; see [docs/adr/0001-io-extensions-are-required-trait-methods.md](docs/adr/0001-io-extensions-are-required-trait-methods.md)). It makes a file's directory entry durable. Out-of-tree `IO` implementations must now implement it; an IO that cannot provide it returns `LimboError::IoExtensionUnsupported`, and `OrphanWalPolicy::Discard` then refuses to open an empty database on it.
+
 ## About
 
 Turso is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations.
