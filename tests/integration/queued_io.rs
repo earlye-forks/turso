@@ -131,6 +131,10 @@ impl IO for QueuedIo {
         self.inner.remove_file(path)
     }
 
+    fn sync_parent_dir(&self, path: &str, c: Completion) -> turso_core::Result<Completion> {
+        self.inner.sync_parent_dir(path, c)
+    }
+
     fn step(&self) -> turso_core::Result<()> {
         self.step_one().map(|_| ())
     }

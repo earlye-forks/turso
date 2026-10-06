@@ -1,5 +1,14 @@
 pub const ENV_DISABLE_FILE_LOCK: &str = "LIMBO_DISABLE_FILE_LOCK";
 
+#[cfg(unix)]
+pub(crate) fn fsync_parent_dir(path: &str) -> std::io::Result<()> {
+    let parent = match std::path::Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()
+}
+
 #[cfg(test)]
 pub mod tests {
     use crate::{Result, IO};

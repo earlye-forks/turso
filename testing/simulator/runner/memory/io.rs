@@ -463,6 +463,12 @@ impl IO for MemorySimIO {
         Ok(())
     }
 
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        self.ensure_io_allowed()?;
+        c.complete(0);
+        Ok(c)
+    }
+
     fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {
         Ok(turso_core::io::FileId::from_path_hash(path))
     }

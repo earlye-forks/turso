@@ -201,6 +201,14 @@ impl IO for WindowsIO {
         Ok(())
     }
 
+    // NTFS records a file's directory entry in its metadata log, and
+    // FlushFileBuffers on the file flushes that log, so syncing the file is
+    // enough. SQLite's os_win.c never syncs directories for the same reason.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())

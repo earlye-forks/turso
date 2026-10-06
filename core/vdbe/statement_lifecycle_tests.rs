@@ -296,6 +296,14 @@ impl crate::IO for NoPumpInsideStepIo {
         self.inner.remove_file(path)
     }
 
+    fn sync_parent_dir(
+        &self,
+        path: &str,
+        c: crate::Completion,
+    ) -> crate::Result<crate::Completion> {
+        self.inner.sync_parent_dir(path, c)
+    }
+
     fn step(&self) -> crate::Result<()> {
         self.note_pump();
         self.inner.step()

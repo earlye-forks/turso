@@ -156,6 +156,12 @@ impl IO for Opfs {
         Ok(())
     }
 
+    fn sync_parent_dir(&self, _path: &str, _c: Completion) -> turso_core::Result<Completion> {
+        Err(turso_core::LimboError::IoExtensionUnsupported(
+            "sync_parent_dir",
+        ))
+    }
+
     fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
         Ok(turso_core::io::FileId::from_path_hash(path))
     }

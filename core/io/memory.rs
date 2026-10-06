@@ -87,6 +87,11 @@ impl IO for MemoryIO {
         Ok(())
     }
 
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     fn file_id(&self, path: &str) -> Result<super::FileId> {
         Ok(super::FileId::from_path_hash(path))
     }
