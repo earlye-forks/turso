@@ -34,6 +34,8 @@ pub mod mvcc;
 pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+#[cfg(all(test, feature = "fs"))]
+mod orphan_wal_tests;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
@@ -128,9 +130,9 @@ pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
-    ConnectAsyncState, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
-    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
-    SharedWalOpenTelemetry,
+    ConnectAsyncState, Database, DatabaseAllocators, DatabaseOpts, EmptyDb, EncryptionOpts,
+    OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, OrphanWalPolicy, ReadOnlyOrphanWal,
+    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};

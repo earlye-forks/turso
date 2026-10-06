@@ -122,6 +122,10 @@ mod tests {
             self.inner.remove_file(path)
         }
 
+        fn sync_parent_dir(&self, path: &str, c: Completion) -> CoreResult<Completion> {
+            self.inner.sync_parent_dir(path, c)
+        }
+
         fn file_id(&self, path: &str) -> CoreResult<turso_core::io::FileId> {
             self.inner.file_id(path)
         }

@@ -393,6 +393,14 @@ impl IO for WindowsIOCP {
         std::fs::remove_file(file_path).map_err(|e| io_error(e, "remove-file"))
     }
 
+    // NTFS records a file's directory entry in its metadata log, and
+    // FlushFileBuffers on the file flushes that log, so syncing the file is
+    // enough. SQLite's os_win.c never syncs directories for the same reason.
+    fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
+        c.complete(0);
+        Ok(c)
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         for cmpl in completions {

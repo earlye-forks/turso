@@ -161,6 +161,14 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
+    fn sync_parent_dir(
+        &self,
+        path: &str,
+        c: turso_core::Completion,
+    ) -> Result<turso_core::Completion> {
+        self.inner.sync_parent_dir(path, c)
+    }
+
     fn file_id(&self, path: &str) -> Result<turso_core::io::FileId> {
         self.inner.file_id(path)
     }

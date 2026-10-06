@@ -129,6 +129,8 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    #[error("the IO backend does not support {0}")]
+    IoExtensionUnsupported(&'static str),
 }
 
 /// `?` in functions returning boxed errors (see `InsnResult`) composes
