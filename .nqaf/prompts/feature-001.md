@@ -99,10 +99,16 @@ length beside an empty db.
 - `OneByte`: also a 1-byte file (SQLite's unix VFS reports a 1-byte file as
   0 bytes; this copies it).
 - `InvalidHeader`: also any file whose page 1 is not a valid header: shorter
-  than 100 bytes, or failing any of: magic `"SQLite format 3\0"`; page size a
-  power of two in 512..=32768, or the value 1 (meaning 65536); payload
-  fractions 64/32/32; schema format 1-4; text encoding 1-3; reserved bytes
-  72-91 all zero. Page 1 is the only self-identifying page, so "no valid
+  than 512 bytes (the smallest page size, so too short for a full page 1,
+  and the existing header read needs 512), or failing any of: magic
+  `"SQLite format 3\0"`; page size a power of two in 512..=32768, or the
+  value 1 (meaning 65536); payload fractions 64/32/32; schema format 0-4;
+  text encoding 0-3; reserved bytes 72-91 all zero. **0 is valid for schema
+  format and text encoding**, because SQLite leaves them at 0 until the first
+  table is created. Rejecting 0 would wipe a real db whose tables are still
+  only in the WAL. The existing header validation accepts 0 too. **An
+  encrypted db never counts as having an invalid header**, because its
+  page 1 can't be checked without the key. Page 1 is the only self-identifying page, so "no valid
   pages" and "invalid page 1" are the same rule. Reuse existing header
   parsing/validation code where it exists rather than duplicating it.
 
@@ -148,11 +154,11 @@ Concurrency guards:
   `lib.rs` ~1291 and ~1325) let a second `Database` in the same process open
   the same file; fcntl locks don't exclude the same process. The in-process
   `DATABASE_MANAGER` registry is otherwise safe (it returns the existing
-  `Database`, so `OpenWal` doesn't run again). Either confirm by reading the
-  code that discard is safe for bypassed opens (the suspected risk is only a
-  zero-page window, since page 1 reaches the db file before any WAL frame),
-  or make `Discard` fail such opens with a clear error. State which you did,
-  and why, in the commit message.
+  `Database`, so `OpenWal` doesn't run again). **Under `Discard`, a
+  registry-bypassed open fails with a clear error.** Another `Database` in
+  the same process may already be using the WAL that `Discard` would
+  truncate. A known consequence: the sync engine reopens the db through this
+  path, so sync-engine users can't combine it with `Discard`.
 
 ### Read-only open under `Discard`
 
@@ -175,8 +181,11 @@ Under any `Discard` value, `allocate_page1` must, after writing page 1 to the
 db file and before the first WAL frame is written:
 
 - fsync the db file (`File::sync`), and
-- if this `Database` created the db file (it did not exist before this
-  open), call `IO::sync_parent_dir(db_path, ..)` and wait for it.
+- call `IO::sync_parent_dir(db_path, ..)` and wait for it. Do this whenever
+  the open found an empty db, including a 0-byte file that already existed.
+  By the time `Database` sees the file it has already been created, so it
+  can't tell whether this open created it. The extra cost is one directory
+  fsync, only for empty dbs.
 
 Without this, a power loss after the first commit can leave a legitimate WAL
 of committed frames beside a db that is absent, 0 bytes, or has a zeroed
@@ -227,7 +236,7 @@ added upstream since this was written. Known impls at `4b59a37`:
 | `GenericIO` | `core/io/generic.rs` | on unix: open parent dir, fsync; elsewhere: no-op `Ok` |
 | `SparseLinuxIo` | `sync/engine/src/sparse_io.rs` | open the parent dir, fsync it |
 | `MemoryIO`, `MemoryYieldIO` (+ test `StepGuardedIO`) | `core/io/memory.rs`, `core/io/memory_yield.rs` | no-op `Ok` (nothing survives a crash) |
-| `WindowsIO`, `WindowsIOCP` | `core/io/windows.rs`, `core/io/win_iocp.rs` | no-op `Ok` (NTFS journals metadata) — **confirm this** and note the conclusion in a code comment; if a directory flush is actually needed, implement it |
+| `WindowsIO`, `WindowsIOCP` | `core/io/windows.rs`, `core/io/win_iocp.rs` | no-op `Ok`, with a code comment saying why: NTFS journals the file creation, and the db-file flush before the first WAL write commits that journal (SQLite relies on the same thing). FAT and exFAT are not covered. |
 | `VfsMod` | `core/io/vfs.rs` | unsupported error (the C-ABI extension has no slot for it) |
 | `Opfs` | `bindings/javascript/src/browser.rs` | unsupported error |
 | `SyncCountingIo` (test) | `core/vdbe/vacuum.rs` | delegate to inner |
@@ -330,6 +339,8 @@ Reproduction. Cover every setting:
    when another process is attached (the `.tshm` authority reports
    `MultiProcess`). Use a real child process, as the existing tests in
    `core/multiprocess_tests.rs` do (re-exec `current_exe` with a filter).
+10. **Registry-bypassed open:** under `Discard`, an
+   `open_with_flags_bypass_registry*` open fails with a clear error.
 
 ## Constraints
 

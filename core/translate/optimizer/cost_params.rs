@@ -51,12 +51,16 @@ pub struct CostModelParams {
     pub in_subquery_rows: f64,
 
     // === Scan/Seek Cost Weights ===
-    /// Discount factor for repeated scans (cache benefit).
-    /// Range: [0, 1). Higher = more cache benefit assumed.
+    /// Cost multiplier for repeated page reads during scans and index searches.
+    /// Range: [0, 1). Lower values assume more cache reuse.
+    /// A value of 0.2 charges a repeated page read at 20% of its first-read cost.
     pub cache_reuse_factor: f64,
 
     /// CPU cost per row processed (relative to page IO = 1.0).
     pub cpu_cost_per_row: f64,
+
+    /// CPU cost for one extra operation in a `WHERE` condition.
+    pub cpu_cost_per_where_step: f64,
 
     /// CPU cost per index seek (key comparisons).
     pub cpu_cost_per_seek: f64,
@@ -81,13 +85,6 @@ pub struct CostModelParams {
 
     /// Estimated bytes per row for hash table spill estimation.
     pub hash_bytes_per_row: f64,
-
-    /// Selectivity threshold for hash join build-side materialization.
-    /// Below this threshold, materialization may be beneficial.
-    pub hash_materialize_selectivity_threshold: f64,
-
-    /// Stricter selectivity threshold for nested hash probe operations.
-    pub hash_nested_probe_selectivity_threshold: f64,
 
     // === Join Optimization ===
     /// Selectivity heuristic factor for closed ranges (e.g., `x > 5 AND x < 10`).
@@ -117,19 +114,18 @@ impl CostModelParams {
             // Scan/Seek costs
             cache_reuse_factor: 0.2,
             cpu_cost_per_row: 0.003,
+            cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
             index_bonus: 0.5,
 
             // Sort costs
             sort_cpu_per_row: 0.002,
 
-            // Hash join specific costs and thresholds
+            // Hash join specific costs
             hash_cpu_cost: 0.001,
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
             hash_bytes_per_row: 100.0,
-            hash_materialize_selectivity_threshold: 0.5,
-            hash_nested_probe_selectivity_threshold: 0.15,
 
             // Join optimization
             closed_range_selectivity_factor: 0.2,
@@ -250,6 +246,7 @@ impl CostModelParams {
         // Cost multipliers must be non-negative
         let cost_params = [
             ("cpu_cost_per_row", self.cpu_cost_per_row),
+            ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
             ("cpu_cost_per_seek", self.cpu_cost_per_seek),
             ("sort_cpu_per_row", self.sort_cpu_per_row),
             ("hash_cpu_cost", self.hash_cpu_cost),

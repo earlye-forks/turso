@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::debug;
+use tracing::{debug, warn};
 use turso_core::{
     Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
 };
@@ -59,17 +59,33 @@ impl SimulatorIO {
         self.file_sizes.clone()
     }
 
-    /// Dump all database files to the specified output directory.
-    /// Only copies the actual file content, not the full mmap size.
+    /// Copy the bytes in each database file (`.db`, `-wal`, `-log`).
+    /// Return `(suffix, bytes)` pairs sorted by suffix.
+    pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        let files = self.files.lock().unwrap();
+        let mut file_bytes: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .filter_map(|(path, file)| {
+                let suffix = [".db", "-wal", "-log"]
+                    .into_iter()
+                    .find(|suffix| path.ends_with(suffix))?;
+                let mmap = file.mmap.lock().unwrap();
+                let actual_size = *file.size.lock().unwrap();
+                Some((suffix.to_string(), mmap[..actual_size].to_vec()))
+            })
+            .collect();
+        file_bytes.sort_by(|a, b| a.0.cmp(&b.0));
+        file_bytes
+    }
+
+    /// Copy all database files to the output directory.
+    /// Copy only the file bytes, not the unused space in the memory mapping.
     pub fn dump_files(&self, out_dir: &std::path::Path) -> anyhow::Result<()> {
         let files = self.files.lock().unwrap();
-        let sizes = self.file_sizes.lock().unwrap();
 
         for (path, file) in files.iter() {
             // Only dump database-related files
             if path.ends_with(".db") || path.ends_with("-wal") || path.ends_with("-log") {
-                let actual_size = sizes.get(path).copied().unwrap_or(0) as usize;
-
                 // Extract just the filename from the path
                 let filename = std::path::Path::new(path)
                     .file_name()
@@ -78,6 +94,7 @@ impl SimulatorIO {
 
                 let dest_path = out_dir.join(&filename);
                 let mmap = file.mmap.lock().unwrap();
+                let actual_size = *file.size.lock().unwrap();
                 std::fs::write(&dest_path, &mmap[..actual_size])?;
                 println!(
                     "Dumped {} ({} bytes) to {}",
@@ -167,7 +184,6 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
-    /// Simulated files live in memory; there is no directory entry to sync.
     fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
         c.complete(0);
         Ok(c)
@@ -242,6 +258,40 @@ type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
 pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
 
+#[cfg(windows)]
+fn mark_sparse(file: &StdFile) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+    let mut bytes_returned = 0;
+    // SAFETY: `file` owns a live handle, the optional input/output buffers are
+    // null with zero lengths, and `bytes_returned` is writable for the call.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == FALSE {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_file: &StdFile) -> std::io::Result<()> {
+    Ok(())
+}
+
 struct SimulatorFile {
     mmap: Mutex<MmapMut>,
     size: Mutex<usize>,
@@ -265,6 +315,9 @@ impl SimulatorFile {
             .open(file_path)
             .unwrap_or_else(|e| panic!("Failed to create file {file_path}: {e}"));
 
+        if let Err(error) = mark_sparse(&file) {
+            warn!(%error, %file_path, "failed to mark simulator file as sparse");
+        }
         file.set_len(MAX_FILE_SIZE as u64)
             .unwrap_or_else(|e| panic!("Failed to truncate file {file_path}: {e}"));
 
@@ -426,5 +479,57 @@ impl File for SimulatorFile {
 
     fn size(&self) -> Result<u64> {
         Ok(*self.size.lock().unwrap() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+
+    use super::*;
+
+    #[test]
+    fn file_copies_and_dumps_keep_bytes_when_paths_contain_dot() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let io = SimulatorIO::new(
+            false,
+            ChaCha8Rng::seed_from_u64(1),
+            IOFaultConfig::default(),
+        );
+        let expected = vec![
+            ("-log".to_string(), vec![7, 8, 9]),
+            ("-wal".to_string(), vec![4, 5]),
+            (".db".to_string(), vec![1, 2, 3, 4]),
+        ];
+        for (suffix, bytes) in &expected {
+            let name = if suffix == ".db" {
+                "snapshot.db".to_string()
+            } else {
+                format!("snapshot.db{suffix}")
+            };
+            let path = directory.path().join(".").join(name);
+            let path = path.to_str().unwrap();
+            let file = io.open_file(path, OpenFlags::default(), false).unwrap();
+            assert_ne!(canonical_key(path), path);
+            let buffer = Arc::new(turso_core::Buffer::new_temporary(bytes.len()));
+            buffer.as_mut_slice().copy_from_slice(bytes);
+            let completion = file
+                .pwrite(0, buffer, Completion::new_write(|_| {}))
+                .unwrap();
+            io.step().unwrap();
+            assert!(completion.succeeded());
+        }
+
+        assert_eq!(io.db_file_bytes(), expected);
+        io.dump_files(output.path()).unwrap();
+        for (suffix, bytes) in expected {
+            let name = if suffix == ".db" {
+                "snapshot.db".to_string()
+            } else {
+                format!("snapshot.db{suffix}")
+            };
+            assert_eq!(std::fs::read(output.path().join(name)).unwrap(), bytes);
+        }
     }
 }

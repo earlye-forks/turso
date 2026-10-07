@@ -11,6 +11,8 @@ on:
       - "Cargo.lock"
       - "core/**"
       - "sdk-kit/**"
+      - "sync/engine/**"
+      - "sync/sdk-kit/**"
   # Manual trigger with dry-run / publish controls
   workflow_dispatch:
     inputs:
@@ -31,6 +33,9 @@ concurrency:
 
 env:
   working-directory: bindings/dotnet
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   # Build native libraries for each platform/architecture
@@ -94,18 +99,20 @@ jobs:
           artifact-name: native-iossimulator-arm64
           ios-deployment-target: "12.2"
 
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           make-target: build-rust-windows64
           target: x86_64-pc-windows-msvc
           artifact-name: native-win-x64
 
+        # Stays on GitHub-hosted: Blacksmith Windows images lack the MSVC ARM64
+        # cross tools (Microsoft.VisualStudio.Component.VC.Tools.ARM64).
         - os: windows-2025
           make-target: build-rust-windowsarm64
           target: aarch64-pc-windows-msvc
           artifact-name: native-win-arm64
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write  # required for Azure OIDC login (code signing on Windows)
@@ -125,6 +132,10 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Setup MSVC
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: "./.github/shared/setup-msvc"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -134,6 +145,8 @@ jobs:
       - name: Set up Android SDK
         if: contains(matrix.target, 'linux-android')
         uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
       - name: Install Android NDK
         if: contains(matrix.target, 'linux-android')
@@ -171,24 +184,24 @@ jobs:
                 export CFLAGS="-DSIMSIMD_TARGET_SIERRA=0 -DSIMSIMD_TARGET_TURIN=0 -DSIMSIMD_TARGET_SAPPHIRE=0 -DSIMSIMD_TARGET_GENOA=0 -DSIMSIMD_TARGET_ICE=0 -DSIMSIMD_TARGET_SKYLAKE=0 -DSIMSIMD_TARGET_HASWELL=0"
                 export CFLAGS_aarch64_unknown_linux_gnu="$CFLAGS"
               fi
-              make ${{ matrix.make-target }} RUST_RELEASE_OPT="--profile release-official"
+              make ${{ matrix.make-target }} RUST_RELEASE_OPT="--profile release-official" RUST_PROFILE_DIR="release-official"
             '
 
       - name: Build rust native library (macOS)
         if: contains(matrix.target, 'apple-darwin')
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-deployment-target }}
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Build rust native library (iOS)
         if: contains(matrix.target, 'apple-ios')
         env:
           IPHONEOS_DEPLOYMENT_TARGET: ${{ matrix.ios-deployment-target }}
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Build rust native library
         if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') }}
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Collect Windows static native dependencies
         if: contains(matrix.target, 'pc-windows-msvc')
@@ -344,14 +357,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package=$(find src/Turso.Data.Sqlite/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.*.nupkg' | head -n 1)
-          if [ -z "$package" ]; then
-            echo "No Turso.Data.Sqlite NuGet package found"
+          native_package=$(find src/Turso.Raw/bin/Release -maxdepth 1 -name 'Turso.Data.Native.*.nupkg' | head -n 1)
+          common_package=$(find src/Turso.Data/bin/Release -maxdepth 1 -name 'Turso.Data.Common.*.nupkg' | head -n 1)
+          provider_package=$(find src/Turso.Data.Sqlite/bin/Release -maxdepth 1 -name 'Turso.Data.Sqlite.Provider.*.nupkg' | head -n 1)
+          if [ -z "$native_package" ]; then
+            echo "No Turso.Data.Native NuGet package found"
             exit 1
           fi
-          unzip -Z1 "$package" > package-files.txt
-          required_files=(
-            "buildTransitive/Turso.Data.Sqlite.targets"
+          if [ -z "$common_package" ]; then
+            echo "No Turso.Data.Common NuGet package found"
+            exit 1
+          fi
+          if [ -z "$provider_package" ]; then
+            echo "No Turso.Data.Sqlite.Provider NuGet package found"
+            exit 1
+          fi
+
+          unzip -Z1 "$native_package" > native-package-files.txt
+          native_required_files=(
+            "buildTransitive/Turso.Data.Native.targets"
+            "runtimes/win-x64/native/turso_sdk_kit.dll"
+            "runtimes/win-arm64/native/turso_sdk_kit.dll"
+            "runtimes/linux-x64/native/libturso_sdk_kit.so"
+            "runtimes/linux-arm64/native/libturso_sdk_kit.so"
+            "runtimes/osx-x64/native/libturso_sdk_kit.dylib"
+            "runtimes/osx-arm64/native/libturso_sdk_kit.dylib"
             "runtimes/android-arm64/native/libturso_sdk_kit.so"
             "runtimes/android-arm/native/libturso_sdk_kit.so"
             "runtimes/android-x64/native/libturso_sdk_kit.so"
@@ -360,24 +390,78 @@ jobs:
             "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64/libturso_sdk_kit.framework/libturso_sdk_kit"
             "runtimes/ios-universal/native/libturso_sdk_kit.xcframework/ios-arm64-simulator/libturso_sdk_kit.framework/libturso_sdk_kit"
           )
-          for required_file in "${required_files[@]}"; do
-            if ! grep -Fxq "$required_file" package-files.txt; then
-              echo "Missing $required_file in $package"
+          for required_file in "${native_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" native-package-files.txt; then
+              echo "Missing $required_file in $native_package"
+              exit 1
+            fi
+          done
+
+          unzip -Z1 "$common_package" > common-package-files.txt
+          common_required_files=(
+            "lib/net8.0/Turso.Data.dll"
+            "lib/net8.0/Turso.Raw.dll"
+            "lib/net8.0/Turso.Raw.xml"
+            "buildTransitive/Turso.Data.Common.targets"
+          )
+          for required_file in "${common_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" common-package-files.txt; then
+              echo "Missing $required_file in $common_package"
+              exit 1
+            fi
+          done
+
+          unzip -Z1 "$provider_package" > provider-package-files.txt
+          provider_required_files=(
+            "lib/net8.0/Turso.Data.Sqlite.dll"
+            "README.md"
+          )
+          for required_file in "${provider_required_files[@]}"; do
+            if ! grep -Fxq "$required_file" provider-package-files.txt; then
+              echo "Missing $required_file in $provider_package"
               exit 1
             fi
           done
 
           max_package_bytes=250000000
-          package_size=$(stat -c%s "$package")
-          if [ "$package_size" -gt "$max_package_bytes" ]; then
-            echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+          for package in "$native_package" "$common_package" "$provider_package"; do
+            package_size=$(stat -c%s "$package")
+            if [ "$package_size" -gt "$max_package_bytes" ]; then
+              echo "$package is $package_size bytes, which exceeds nuget.org's $max_package_bytes byte package limit"
+              exit 1
+            fi
+          done
+
+          if grep -Eq '^runtimes/' provider-package-files.txt; then
+            echo "Dynamic native assets must stay in Turso.Data.Native, not $provider_package"
+            exit 1
+          fi
+          if grep -Eq '(^|/)(Turso.Raw|Turso.Data)\.(dll|xml)$' provider-package-files.txt; then
+            echo "Shared assemblies must stay in Turso.Data.Common and Turso.Data.Native, not $provider_package"
             exit 1
           fi
 
-          if grep -Eq '^buildTransitive/native/(win|linux|osx)-' package-files.txt; then
-            echo "Static NativeAOT assets must stay in RID-specific companion packages, not $package"
-            exit 1
-          fi
+          while IFS= read -r package; do
+            package_entries=$(mktemp)
+            unzip -Z1 "$package" > "$package_entries"
+            if grep -Fq "turso_sync_sdk_kit" "$package_entries"; then
+              echo "Internal Rust crate name leaked into $package"
+              exit 1
+            fi
+            rm "$package_entries"
+          done < <(find src -path '*/bin/Release/*.nupkg' -type f)
+
+          android_native=$(mktemp)
+          unzip -p "$native_package" runtimes/android-arm64/native/libturso_sdk_kit.so > "$android_native"
+          python3 scripts/check_elf_dynsym_exports.py "$android_native" \
+            turso_sync_database_new \
+            turso_sync_database_create \
+            turso_sync_database_open \
+            turso_sync_database_connect \
+            turso_sync_database_stats \
+            turso_sync_database_checkpoint \
+            turso_sync_database_deinit
+          rm "$android_native"
 
           static_packages=(
             "win-x64:turso_sdk_kit.lib"
@@ -390,9 +474,9 @@ jobs:
           for static_package_spec in "${static_packages[@]}"; do
             rid="${static_package_spec%%:*}"
             library="${static_package_spec#*:}"
-            static_package=$(find src/Turso.Data.Sqlite.NativeAot/bin/Release -maxdepth 1 -name "Turso.Data.Sqlite.NativeAot.${rid}.*.nupkg" | head -n 1)
+            static_package=$(find src/Turso.Data.Sqlite.NativeAot/bin/Release -maxdepth 1 -name "Turso.Data.NativeAot.${rid}.*.nupkg" | head -n 1)
             if [ -z "$static_package" ]; then
-              echo "No Turso.Data.Sqlite.NativeAot.${rid} NuGet package found"
+              echo "No Turso.Data.NativeAot.${rid} NuGet package found"
               exit 1
             fi
 
@@ -404,7 +488,7 @@ jobs:
 
             unzip -Z1 "$static_package" > "package-files-${rid}.txt"
             required_static_files=(
-              "buildTransitive/Turso.Data.Sqlite.NativeAot.${rid}.targets"
+              "buildTransitive/Turso.Data.NativeAot.${rid}.targets"
               "buildTransitive/native/${rid}/${library}"
             )
             for required_static_file in "${required_static_files[@]}"; do
@@ -427,8 +511,12 @@ jobs:
           rm -rf artifacts/nuget-packages
           mkdir -p artifacts/nuget-packages
           files=(
-            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.*.nupkg
-            src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.Sqlite.NativeAot.*.nupkg
+            src/Turso.Raw/bin/Release/Turso.Data.Native.*.nupkg
+            src/Turso.Data/bin/Release/Turso.Data.Common.*.nupkg
+            src/Turso.Data.Sqlite/bin/Release/Turso.Data.Sqlite.Provider.*.nupkg
+            src/Turso.Data.Sqlite.NativeAot/bin/Release/Turso.Data.NativeAot.*.nupkg
+            src/Turso.Platform.Client/bin/Release/Turso.Platform.Client.*.nupkg
+            src/Turso.Serverless.Client/bin/Release/Turso.Serverless.Client.*.nupkg
           )
           if [ ${#files[@]} -eq 0 ]; then
             echo "No NuGet packages found to upload"
@@ -449,7 +537,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - os: windows-2025
+        - os: blacksmith-4vcpu-windows-2025
           rid: win-x64
           executable: NativeAotSample.exe
 
@@ -521,8 +609,10 @@ jobs:
             </packageSources>
             <packageSourceMapping>
               <packageSource key="local">
-                <package pattern="Turso.Data.Sqlite" />
-                <package pattern="Turso.Data.Sqlite.NativeAot.*" />
+                <package pattern="Turso.Data.Sqlite.Provider" />
+                <package pattern="Turso.Data.Common" />
+                <package pattern="Turso.Data.Native" />
+                <package pattern="Turso.Data.NativeAot.*" />
               </packageSource>
               <packageSource key="nuget.org">
                 <package pattern="*" />
@@ -563,14 +653,223 @@ jobs:
           if ($output -notcontains "Rows: 3") {
             throw "Unexpected NativeAOT sample output: $output"
           }
+          if (-not ($output -match "^Stats revision:")) {
+            throw "NativeAOT sample did not read sync statistics: $output"
+          }
+          foreach ($expectedLine in @("Checkpoint: complete", "Disposed: complete")) {
+            if ($output -notcontains $expectedLine) {
+              throw "NativeAOT sample did not exercise the sync lifecycle ($expectedLine): $output"
+            }
+          }
+
+  validate-android-package:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ''
+
+      - name: Install Android workload and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet workload install android
+          sdkmanager --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Build Android package consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_source=$(realpath artifacts/nuget-packages)
+          nuget_config=samples/MobilePackageConsumer/NuGet.config
+          cat > "$nuget_config" <<EOF
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$package_source" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="Turso.Data.Sqlite.Provider" />
+                <package pattern="Turso.Data.Common" />
+                <package pattern="Turso.Data.Native" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+
+          project=samples/MobilePackageConsumer/Android/AndroidPackageConsumer.csproj
+          dotnet restore "$project" -r android-arm64 --configfile "$nuget_config"
+          dotnet build "$project" -c Release -f net10.0-android -r android-arm64 \
+            --no-restore -t:SignAndroidPackage -p:AndroidPackageFormats=apk
+
+      - name: Verify Android native asset and sync exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(find samples/MobilePackageConsumer/Android/bin/Release -path '*android-arm64*' -name '*-Signed.apk' -print -quit)
+          if [ -z "$apk" ]; then
+            apk=$(find samples/MobilePackageConsumer/Android/bin/Release -name '*-Signed.apk' -print -quit)
+          fi
+          if [ -z "$apk" ]; then
+            echo "Android package consumer did not produce a signed APK"
+            exit 1
+          fi
+          echo "Checking Android APK $apk"
+
+          native_entry=lib/arm64-v8a/libturso_sdk_kit.so
+          if ! unzip -Z1 "$apk" | grep -Fxq "$native_entry"; then
+            echo "$apk does not contain $native_entry"
+            unzip -Z1 "$apk" | grep -E 'lib/|\.so$' || true
+            exit 1
+          fi
+
+          mkdir -p artifacts/mobile-android
+          unzip -p "$apk" "$native_entry" > artifacts/mobile-android/libturso_sdk_kit.so
+          echo "Extracted $native_entry ($(wc -c < artifacts/mobile-android/libturso_sdk_kit.so) bytes)"
+          python3 scripts/check_elf_dynsym_exports.py artifacts/mobile-android/libturso_sdk_kit.so \
+            turso_sync_database_new \
+            turso_sync_database_create \
+            turso_sync_database_open \
+            turso_sync_database_connect \
+            turso_sync_database_stats \
+            turso_sync_database_checkpoint \
+            turso_sync_database_deinit
+
+  validate-ios-package:
+    needs: publish
+    runs-on: macos-26
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install dotnet SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      # Workload set 10.0.401.1 moved the iOS SDK to 27.0, which requires
+      # Xcode 27. The macos-26 runner image only ships Xcode 26.x, so stay on
+      # the last workload set whose iOS SDK (26.5) builds with Xcode 26.
+      - name: Install iOS workload
+        run: dotnet workload install ios --version 10.0.401
+
+      - name: Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          name: nuget-packages
+          path: ${{ env.working-directory }}/artifacts/nuget-packages
+
+      - name: Build iOS package consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_source=$(realpath artifacts/nuget-packages)
+          nuget_config=samples/MobilePackageConsumer/NuGet.config
+          cat > "$nuget_config" <<EOF
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="local" value="$package_source" />
+              <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+            <packageSourceMapping>
+              <packageSource key="local">
+                <package pattern="Turso.Data.Sqlite.Provider" />
+                <package pattern="Turso.Data.Common" />
+                <package pattern="Turso.Data.Native" />
+              </packageSource>
+              <packageSource key="nuget.org">
+                <package pattern="*" />
+              </packageSource>
+            </packageSourceMapping>
+          </configuration>
+          EOF
+
+          project=samples/MobilePackageConsumer/iOS/IosPackageConsumer.csproj
+          dotnet restore "$project" -r iossimulator-arm64 --configfile "$nuget_config"
+          dotnet build "$project" -c Release -f net10.0-ios -r iossimulator-arm64 --no-restore \
+            -p:CodesignKey= -p:CodesignProvision=
+
+      - name: Verify iOS native asset and sync exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=$(find samples/MobilePackageConsumer/iOS/bin/Release -name '*.app' -type d -print -quit)
+          if [ -z "$app" ]; then
+            echo "iOS package consumer did not produce an app bundle"
+            exit 1
+          fi
+
+          framework="$app/Frameworks/libturso_sdk_kit.framework/libturso_sdk_kit"
+          if [ ! -f "$framework" ]; then
+            echo "$app does not contain the legacy-named libturso_sdk_kit framework"
+            exit 1
+          fi
+
+          for symbol in \
+            turso_sync_database_new \
+            turso_sync_database_create \
+            turso_sync_database_open \
+            turso_sync_database_connect \
+            turso_sync_database_stats \
+            turso_sync_database_checkpoint \
+            turso_sync_database_deinit
+          do
+            if ! nm -gU "$framework" | grep -Eq "[[:space:]]_${symbol}$"; then
+              echo "iOS package asset does not export $symbol"
+              exit 1
+            fi
+          done
 
   publish-to-nuget:
-    needs: validate-nativeaot-static-package
+    needs: [validate-nativeaot-static-package, validate-android-package, validate-ios-package]
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip-publish && !inputs.dry-run }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
+      # Required so nuget.org's trusted publishing policy can validate this
+      # workflow's OIDC token and mint a short-lived API key.
+      id-token: write
 
     steps:
       - name: Install dotnet SDK
@@ -584,9 +883,21 @@ jobs:
           name: nuget-packages
           path: nuget-packages
 
+      # Trusted publishing: swap the GitHub OIDC token for a NuGet API key that
+      # is only valid for an hour, so this must stay directly before the push.
+      # https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing
+      - name: NuGet login
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          # The individual nuget.org account the policy is registered under, not
+          # the package owner. Packages land under whichever owner the policy's
+          # "Package owner" field names (Turso), not under this account.
+          user: pjenberg
+
       # https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
       - name: Publish to nuget
         run: |
           for package in nuget-packages/*.nupkg; do
-            dotnet nuget push "$package" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+            dotnet nuget push "$package" --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
           done

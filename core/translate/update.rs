@@ -6,7 +6,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, BindingBehavior};
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{ColumnMask, Operation};
-use crate::translate::planner::{parse_limit, ROWID_STRS};
+use crate::translate::planner::ROWID_STRS;
 use crate::{
     bail_parse_error,
     schema::{Schema, Table},
@@ -202,7 +202,6 @@ fn prepare_and_optimize_update_plan(
 
 fn validate_update(
     schema: &Schema,
-    body: &ast::Update,
     table_name: &str,
     is_internal_schema_change: bool,
     conn: &Arc<Connection>,
@@ -214,9 +213,6 @@ fn validate_update(
         && !crate::schema::allow_user_dml(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
-    }
-    if !body.order_by.is_empty() {
-        bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
     // Check if this is a materialized view
     if schema.is_materialized_view(table_name) {
@@ -250,7 +246,10 @@ fn prepare_update_plan(
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
         Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", target_name),
+        None => bail_parse_error!(
+            "no such table: {}",
+            crate::util::table_name_for_error(&body.tbl_name)
+        ),
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         bail_parse_error!(
@@ -265,7 +264,6 @@ fn prepare_update_plan(
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
         schema,
-        &body,
         target_name.as_str(),
         is_internal_schema_change,
         connection,
@@ -283,12 +281,14 @@ fn prepare_update_plan(
         identifier: body.tbl_name.identifier(),
         internal_id: program.table_reference_counter.next(),
         op: Operation::default_scan_for(&table),
+        unmatched_right_rows_plan: None,
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
+        plan_estimate: None,
     };
     let mut from_tables = TableReferences::new_empty();
     let mut where_clause = vec![];
@@ -348,9 +348,6 @@ fn prepare_update_plan(
     )?;
 
     let mut read_scope_tables = TableReferences::new(vec![target_table], vec![]);
-    if from_tables.right_join_swapped() {
-        read_scope_tables.set_right_join_swapped();
-    }
     read_scope_tables.extend(from_tables);
 
     for set in &mut body.sets {
@@ -406,13 +403,6 @@ fn prepare_update_plan(
     };
 
     let columns = table.columns();
-    append_vtab_predicates_to_where_clause(
-        &mut vtab_predicates,
-        &mut read_scope_tables,
-        &result_columns,
-        &mut where_clause,
-        resolver,
-    )?;
     parse_where(
         body.where_clause.as_deref(),
         &mut read_scope_tables,
@@ -420,10 +410,13 @@ fn prepare_update_plan(
         &mut where_clause,
         resolver,
     )?;
-
-    let (limit, offset) = body
-        .limit
-        .map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
+    append_vtab_predicates_to_where_clause(
+        &mut vtab_predicates,
+        &mut read_scope_tables,
+        &result_columns,
+        &mut where_clause,
+        resolver,
+    )?;
 
     let indexes_to_update = collect_indexes_to_update(
         &table,
@@ -447,8 +440,6 @@ fn prepare_update_plan(
         set_clauses,
         where_clause,
         returning: (!result_columns.is_empty()).then_some(result_columns),
-        limit,
-        offset,
         contains_constant_false_condition: false,
         indexes_to_update,
         write_set_plan: None,

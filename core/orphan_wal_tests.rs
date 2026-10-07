@@ -1,142 +1,690 @@
-//! Regression tests for `OrphanWalPolicy`: a leftover `-wal` beside an
-//! absent or empty db file.
-
 use super::*;
-use crate::io::FileSyncType;
+use crate::io::{FileId, FileSyncType};
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use std::path::{Path, PathBuf};
+#[cfg(all(
+    host_shared_wal,
+    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+))]
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
-const DISCARD_RULES: [EmptyDb; 3] = [EmptyDb::ZeroBytes, EmptyDb::OneByte, EmptyDb::InvalidHeader];
+#[cfg(all(
+    host_shared_wal,
+    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+))]
+const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
+    "orphan_wal_tests::multiprocess_hold_open_child_process";
 
-fn discard(empty: EmptyDb, read_only: ReadOnlyOrphanWal) -> OrphanWalPolicy {
-    OrphanWalPolicy::Discard { empty, read_only }
+const DISCARD_ZERO_BYTES: OrphanWalPolicy = OrphanWalPolicy::Discard {
+    empty: EmptyDb::ZeroBytes,
+    read_only: ReadOnlyOrphanWal::Ignore,
+};
+const DISCARD_ONE_BYTE: OrphanWalPolicy = OrphanWalPolicy::Discard {
+    empty: EmptyDb::OneByte,
+    read_only: ReadOnlyOrphanWal::Ignore,
+};
+const DISCARD_INVALID_HEADER: OrphanWalPolicy = OrphanWalPolicy::Discard {
+    empty: EmptyDb::InvalidHeader,
+    read_only: ReadOnlyOrphanWal::Ignore,
+};
+const OLD_TABLES: [&str; 3] = ["old_t", "old_u", "old_v"];
+
+#[test]
+fn replay_policy_keeps_upstream_open_behaviour() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, None, Some(orphan_wal()));
+    let io = RecordingIo::new(&paths, true);
+
+    let db = open_db(
+        io.clone(),
+        &paths,
+        OpenFlags::default(),
+        OrphanWalPolicy::Replay,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    assert!(table_names(&conn).is_empty());
+    assert_eq!(io.count(IoEvent::RemoveFile), 1);
+    assert_eq!(io.count(IoEvent::DbSync), 0);
+    assert_eq!(io.count(IoEvent::ParentDirSync), 0);
+
+    rollback_create_table(&conn);
+    assert_eq!(file_len(&paths.db), 4096);
+    assert_eq!(io.count(IoEvent::DbSync), 1);
+    assert_eq!(io.count(IoEvent::ParentDirSync), 0);
+    assert!(table_names(&db.connect().unwrap()).is_empty());
+    drop(conn);
+    drop(db);
+
+    let db = open_db(
+        platform_io(),
+        &paths,
+        OpenFlags::default(),
+        OrphanWalPolicy::Replay,
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    assert!(table_names(&conn).is_empty());
+    assert_eq!(integrity_check(&conn), "ok");
+}
+
+#[test]
+fn zero_bytes_rule_discards_wal_beside_absent_or_zero_byte_db() {
+    for db_contents in [None, Some(&[][..])] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths::new(dir.path());
+        place_files(&paths, db_contents, Some(orphan_wal()));
+        let io = RecordingIo::new(&paths, true);
+
+        let db = open_db(io.clone(), &paths, OpenFlags::default(), DISCARD_ZERO_BYTES).unwrap();
+        assert_eq!(file_len(&paths.wal), 0);
+        assert_eq!(io.count(IoEvent::RemoveFile), 0);
+        let conn = db.connect().unwrap();
+        assert!(table_names(&conn).is_empty());
+        rollback_create_table(&conn);
+        assert!(table_names(&db.connect().unwrap()).is_empty());
+        drop(conn);
+        drop(db);
+
+        assert_reopens_empty(&paths, DISCARD_ZERO_BYTES);
+    }
+}
+
+#[test]
+fn zero_bytes_rule_keeps_wal_beside_one_byte_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, Some(&[0]), Some(orphan_wal()));
+
+    let result = open_db(
+        platform_io(),
+        &paths,
+        OpenFlags::default(),
+        DISCARD_ZERO_BYTES,
+    );
+    drop(result);
+    assert_eq!(std::fs::read(&paths.db).unwrap(), vec![0]);
+    assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+}
+
+#[test]
+fn one_byte_rule_discards_wal_beside_one_byte_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, Some(&[0]), Some(orphan_wal()));
+
+    let db = open_db(
+        platform_io(),
+        &paths,
+        OpenFlags::default(),
+        DISCARD_ONE_BYTE,
+    )
+    .unwrap();
+    assert_eq!(file_len(&paths.db), 0);
+    assert_eq!(file_len(&paths.wal), 0);
+    let conn = db.connect().unwrap();
+    assert!(table_names(&conn).is_empty());
+    rollback_create_table(&conn);
+    drop(conn);
+    drop(db);
+
+    assert_reopens_empty(&paths, DISCARD_ONE_BYTE);
+}
+
+#[test]
+fn invalid_header_rule_truncates_zeroed_db_with_or_without_wal() {
+    for wal in [Some(orphan_wal()), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths::new(dir.path());
+        place_files(&paths, Some(&[0; 4096]), wal);
+
+        let db = open_db(
+            platform_io(),
+            &paths,
+            OpenFlags::default(),
+            DISCARD_INVALID_HEADER,
+        )
+        .unwrap();
+        assert_eq!(file_len(&paths.db), 0);
+        assert_eq!(file_len(&paths.wal), 0);
+        let conn = db.connect().unwrap();
+        assert!(table_names(&conn).is_empty());
+        drop(conn);
+        drop(db);
+
+        assert_reopens_empty(&paths, DISCARD_INVALID_HEADER);
+    }
+}
+
+#[test]
+fn invalid_header_rule_treats_db_shorter_than_512_bytes_as_invalid() {
+    let mut short_db = vec![0u8; 200];
+    short_db[..DatabaseHeader::SIZE]
+        .copy_from_slice(bytemuck::bytes_of(&DatabaseHeader::default()));
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, Some(&short_db), Some(orphan_wal()));
+    let result = open_db(
+        platform_io(),
+        &paths,
+        OpenFlags::default(),
+        DISCARD_ONE_BYTE,
+    );
+    drop(result);
+    assert_eq!(std::fs::read(&paths.db).unwrap(), short_db);
+    assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+
+    let err = open_db(
+        platform_io(),
+        &paths,
+        OpenFlags::ReadOnly,
+        DISCARD_INVALID_HEADER,
+    )
+    .expect_err("a read-only open of a db shorter than 512 bytes must fail");
+    assert!(matches!(err, LimboError::Corrupt(_)), "{err:?}");
+    assert_eq!(std::fs::read(&paths.db).unwrap(), short_db);
+    assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+
+    let db = open_db(
+        platform_io(),
+        &paths,
+        OpenFlags::default(),
+        DISCARD_INVALID_HEADER,
+    )
+    .unwrap();
+    assert_eq!(file_len(&paths.db), 0);
+    assert_eq!(file_len(&paths.wal), 0);
+    assert!(table_names(&db.connect().unwrap()).is_empty());
+}
+
+#[test]
+fn valid_db_with_wal_replays_under_every_empty_db_rule() {
+    let source = tempfile::tempdir().unwrap();
+    let source_paths = DbPaths::new(source.path());
+    let (db_bytes, wal_bytes) = {
+        let db = open_db(
+            platform_io(),
+            &source_paths,
+            OpenFlags::default(),
+            OrphanWalPolicy::Replay,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE kept(x)").unwrap();
+        conn.execute("INSERT INTO kept VALUES (1), (2), (3)")
+            .unwrap();
+        (
+            std::fs::read(&source_paths.db).unwrap(),
+            std::fs::read(&source_paths.wal).unwrap(),
+        )
+    };
+    assert!(!wal_bytes.is_empty());
+
+    for policy in [DISCARD_ZERO_BYTES, DISCARD_ONE_BYTE, DISCARD_INVALID_HEADER] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths::new(dir.path());
+        place_files(&paths, Some(&db_bytes), Some(&wal_bytes));
+
+        let db = open_db(platform_io(), &paths, OpenFlags::default(), policy).unwrap();
+        let conn = db.connect().unwrap();
+        assert_eq!(table_names(&conn), vec!["kept".to_string()], "{policy:?}");
+        assert_eq!(query_i64(&conn, "SELECT count(*) FROM kept"), 3);
+        assert_eq!(integrity_check(&conn), "ok");
+    }
+}
+
+#[test]
+fn read_only_ignore_reads_empty_and_leaves_files_untouched() {
+    for (db_contents, empty) in [(&[][..], EmptyDb::ZeroBytes), (&[0][..], EmptyDb::OneByte)] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths::new(dir.path());
+        place_files(&paths, Some(db_contents), Some(orphan_wal()));
+        let policy = OrphanWalPolicy::Discard {
+            empty,
+            read_only: ReadOnlyOrphanWal::Ignore,
+        };
+
+        let db = open_db(platform_io(), &paths, OpenFlags::ReadOnly, policy).unwrap();
+        let conn = db.connect().unwrap();
+        assert!(table_names(&conn).is_empty(), "{empty:?}");
+        drop(conn);
+        drop(db);
+
+        assert_eq!(std::fs::read(&paths.db).unwrap(), db_contents);
+        assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+    }
+}
+
+#[test]
+fn read_only_replay_matches_replay_policy() {
+    let discard_read_only_replay = OrphanWalPolicy::Discard {
+        empty: EmptyDb::ZeroBytes,
+        read_only: ReadOnlyOrphanWal::Replay,
+    };
+    let outcomes: Vec<_> = [OrphanWalPolicy::Replay, discard_read_only_replay]
+        .into_iter()
+        .map(|policy| {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = DbPaths::new(dir.path());
+            place_files(&paths, Some(&[]), Some(orphan_wal()));
+            let db = open_db(platform_io(), &paths, OpenFlags::ReadOnly, policy).unwrap();
+            let tables = table_names(&db.connect().unwrap());
+            drop(db);
+            (
+                tables,
+                std::fs::read(&paths.db).unwrap(),
+                std::fs::read(&paths.wal).unwrap() == orphan_wal(),
+            )
+        })
+        .collect();
+    assert_eq!(outcomes[0], outcomes[1]);
+}
+
+#[test]
+fn read_only_open_of_invalid_header_db_fails_without_touching_files() {
+    for read_only in [ReadOnlyOrphanWal::Ignore, ReadOnlyOrphanWal::Replay] {
+        for db_contents in [&[0; 4096][..], &[7; 50][..], &[0][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = DbPaths::new(dir.path());
+            place_files(&paths, Some(db_contents), Some(orphan_wal()));
+            let policy = OrphanWalPolicy::Discard {
+                empty: EmptyDb::InvalidHeader,
+                read_only,
+            };
+
+            let err = open_db(platform_io(), &paths, OpenFlags::ReadOnly, policy)
+                .expect_err("a read-only open of a db with an invalid header must fail");
+            assert!(
+                matches!(err, LimboError::Corrupt(ref msg) if msg.contains("valid database header")),
+                "{err:?}"
+            );
+            assert_eq!(std::fs::read(&paths.db).unwrap(), db_contents);
+            assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+        }
+    }
+}
+
+#[test]
+fn discard_syncs_db_file_and_parent_dir_before_first_wal_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, None, Some(orphan_wal()));
+    let io = RecordingIo::new(&paths, true);
+
+    let db = open_db(io.clone(), &paths, OpenFlags::default(), DISCARD_ZERO_BYTES).unwrap();
+    let conn = db.connect().unwrap();
+    io.clear();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    let events = io.events();
+    let first_wal_write = events
+        .iter()
+        .position(|event| *event == IoEvent::WalWrite)
+        .expect("the commit must write the WAL");
+    assert_eq!(
+        &events[..first_wal_write],
+        &[IoEvent::DbWrite, IoEvent::DbSync, IoEvent::ParentDirSync]
+    );
+}
+
+#[test]
+fn discard_fails_open_of_empty_db_when_io_cannot_sync_parent_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_paths = DbPaths::new(dir.path());
+    let io = RecordingIo::new(&empty_paths, false);
+
+    let err = open_db(
+        io.clone(),
+        &empty_paths,
+        OpenFlags::default(),
+        DISCARD_ZERO_BYTES,
+    )
+    .expect_err("Discard must refuse an IO that cannot sync the parent directory");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref msg) if msg.contains("sync_parent_dir")),
+        "{err:?}"
+    );
+
+    let filled_paths = DbPaths {
+        db: dir.path().join("filled.db"),
+        wal: dir.path().join("filled.db-wal"),
+    };
+    {
+        let db = open_db(
+            io.clone(),
+            &filled_paths,
+            OpenFlags::default(),
+            OrphanWalPolicy::Replay,
+        )
+        .unwrap();
+        db.connect()
+            .unwrap()
+            .execute("CREATE TABLE kept(x)")
+            .unwrap();
+    }
+    let db = open_db(io, &filled_paths, OpenFlags::default(), DISCARD_ZERO_BYTES).unwrap();
+    assert_eq!(
+        table_names(&db.connect().unwrap()),
+        vec!["kept".to_string()]
+    );
+}
+
+#[test]
+fn discard_fails_registry_bypassing_open_without_touching_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, Some(&[]), Some(orphan_wal()));
+    let io = platform_io();
+    let path = paths.db.to_str().unwrap();
+
+    for policy in [DISCARD_ZERO_BYTES, DISCARD_ONE_BYTE, DISCARD_INVALID_HEADER] {
+        let err = open_bypassing_registry(io.clone(), path, policy)
+            .expect_err("Discard must refuse an open that skips the registry");
+        assert!(
+            matches!(err, LimboError::InvalidArgument(ref msg) if msg.contains("registry")),
+            "{err:?}"
+        );
+        assert_eq!(file_len(&paths.db), 0);
+        assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+    }
+
+    let db = open_bypassing_registry(io, path, OrphanWalPolicy::Replay).unwrap();
+    assert!(table_names(&db.connect().unwrap()).is_empty());
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
+fn discard_fails_do_open_before_creating_db_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+
+    let err = Database::do_open(
+        platform_io(),
+        paths.db.to_str().unwrap(),
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_orphan_wal_policy(DISCARD_ZERO_BYTES)),
+    )
+    .expect_err("Discard must refuse an open that skips the registry");
+    assert!(
+        matches!(err, LimboError::InvalidArgument(ref msg) if msg.contains("registry")),
+        "{err:?}"
+    );
+    assert!(!paths.db.exists());
+    assert!(!paths.wal.exists());
+}
+
+#[cfg(all(
+    host_shared_wal,
+    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+))]
+#[test]
+fn multiprocess_discard_fails_when_another_process_is_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = DbPaths::new(dir.path());
+    place_files(&paths, Some(&[]), None);
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_ORPHAN_WAL_DB_PATH", &paths.db)
+        .env("TURSO_ORPHAN_WAL_READY_FILE", &ready_file)
+        .env("TURSO_ORPHAN_WAL_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+    std::fs::write(&paths.wal, orphan_wal()).unwrap();
+
+    let result = Database::open_file_with_flags(
+        platform_io(),
+        paths.db.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new()
+            .with_multiprocess_wal(true)
+            .with_orphan_wal_policy(DISCARD_ZERO_BYTES),
+        None,
+        Arc::new(SqliteDialect),
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(child.wait().unwrap().success());
+    let err = result.expect_err("Discard must not touch files another process is attached to");
+    assert!(
+        matches!(err, LimboError::LockingError(ref msg) if msg.contains("orphan WAL")),
+        "{err:?}"
+    );
+    assert_eq!(file_len(&paths.db), 0);
+    assert_eq!(std::fs::read(&paths.wal).unwrap(), orphan_wal());
+}
+
+#[cfg(all(
+    host_shared_wal,
+    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+))]
+#[test]
+fn multiprocess_hold_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_ORPHAN_WAL_DB_PATH") else {
+        return;
+    };
+    let ready_file = PathBuf::from(std::env::var_os("TURSO_ORPHAN_WAL_READY_FILE").unwrap());
+    let release_file = PathBuf::from(std::env::var_os("TURSO_ORPHAN_WAL_RELEASE_FILE").unwrap());
+
+    let db = Database::open_file_with_flags(
+        platform_io(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new().with_multiprocess_wal(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+    drop(db);
+}
+
+struct DbPaths {
+    db: PathBuf,
+    wal: PathBuf,
+}
+
+impl DbPaths {
+    fn new(dir: &Path) -> Self {
+        Self {
+            db: dir.join("g.db"),
+            wal: dir.join("g.db-wal"),
+        }
+    }
+}
+
+fn orphan_wal() -> &'static [u8] {
+    static ORPHAN_WAL: OnceLock<Vec<u8>> = OnceLock::new();
+    ORPHAN_WAL.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = DbPaths::new(dir.path());
+        let db = Database::open_file(
+            platform_io(),
+            paths.db.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE old_t(x, b)").unwrap();
+        conn.execute("CREATE TABLE old_u(z)").unwrap();
+        conn.execute("CREATE TABLE old_v(w)").unwrap();
+        for i in 0..300 {
+            conn.execute(format!("INSERT INTO old_t VALUES ({i}, randomblob(200))"))
+                .unwrap();
+            conn.execute("INSERT INTO old_v VALUES (randomblob(300))")
+                .unwrap();
+        }
+        assert_eq!(table_names(&conn), OLD_TABLES);
+        let wal = std::fs::read(&paths.wal).unwrap();
+        assert!(wal.len() > 2_000_000, "WAL holds {} bytes", wal.len());
+        wal
+    })
+}
+
+fn place_files(paths: &DbPaths, db_contents: Option<&[u8]>, wal_contents: Option<&[u8]>) {
+    for (path, contents) in [(&paths.db, db_contents), (&paths.wal, wal_contents)] {
+        match contents {
+            Some(contents) => std::fs::write(path, contents).unwrap(),
+            None => assert!(!path.exists()),
+        }
+    }
 }
 
 fn platform_io() -> Arc<dyn IO> {
     Arc::new(PlatformIO::new().unwrap())
 }
 
-fn open_with(
+fn open_db(
     io: Arc<dyn IO>,
-    path: &Path,
+    paths: &DbPaths,
     flags: OpenFlags,
     policy: OrphanWalPolicy,
 ) -> Result<Arc<Database>> {
     Database::open_file_with_flags(
         io,
-        path.to_str().unwrap(),
+        paths.db.to_str().unwrap(),
         flags,
         DatabaseOpts::new().with_orphan_wal_policy(policy),
         None,
+        Arc::new(SqliteDialect),
     )
 }
 
-fn open_rw(path: &Path, policy: OrphanWalPolicy) -> Result<Arc<Database>> {
-    open_with(platform_io(), path, OpenFlags::default(), policy)
+fn open_bypassing_registry(
+    io: Arc<dyn IO>,
+    path: &str,
+    policy: OrphanWalPolicy,
+) -> Result<Arc<Database>> {
+    let file = io.open_file(path, OpenFlags::default(), true)?;
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(Arc::new(crate::storage::database::DatabaseFile::new(file)))
+        .db_opts(DatabaseOpts::new().with_orphan_wal_policy(policy));
+    let mut state = OpenDbAsyncState::new();
+    loop {
+        match Database::do_open_async(&mut state, io.clone(), path, &options)? {
+            IOResult::Done(db) => return Ok(db),
+            IOResult::IO(completion) => completion.wait(&*io)?,
+        }
+    }
 }
 
-fn query_strings(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
-    let mut stmt = conn.prepare(sql).unwrap();
-    let mut out = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        out.push(row.get_value(0).to_string());
-        Ok(())
-    })
-    .unwrap();
-    out
-}
-
-fn schema_names(conn: &Arc<Connection>) -> Vec<String> {
-    query_strings(conn, "SELECT name FROM sqlite_schema ORDER BY name")
-}
-
-fn integrity_check(conn: &Arc<Connection>) -> Vec<String> {
-    query_strings(conn, "PRAGMA integrity_check")
-}
-
-/// `BEGIN; CREATE TABLE z(q); ROLLBACK;` allocates page 1 without committing.
-fn rolled_back_write(conn: &Arc<Connection>) {
+fn rollback_create_table(conn: &Arc<Connection>) {
     conn.execute("BEGIN").unwrap();
     conn.execute("CREATE TABLE z(q)").unwrap();
     conn.execute("ROLLBACK").unwrap();
 }
 
-fn wal_path(db_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}-wal", db_path.display()))
-}
-
-fn file_len(path: &Path) -> Option<u64> {
-    std::fs::metadata(path).ok().map(|m| m.len())
-}
-
-/// Builds the old database of the reproduction and returns its WAL bytes,
-/// copied while the database was still open.
-fn build_old_wal(dir: &Path) -> Vec<u8> {
-    let path = dir.join("source.db");
-    let db = open_rw(&path, OrphanWalPolicy::Replay).unwrap();
+fn assert_reopens_empty(paths: &DbPaths, policy: OrphanWalPolicy) {
+    let db = open_db(platform_io(), paths, OpenFlags::default(), policy).unwrap();
     let conn = db.connect().unwrap();
-    conn.execute("CREATE TABLE old_t(x, b)").unwrap();
-    conn.execute("CREATE TABLE old_u(z)").unwrap();
-    conn.execute("CREATE TABLE old_v(w)").unwrap();
-    for i in 0..300 {
-        conn.execute(format!("INSERT INTO old_t VALUES ({i}, randomblob(200))"))
-            .unwrap();
-        conn.execute("INSERT INTO old_v VALUES (randomblob(300))")
-            .unwrap();
-    }
-    let wal = std::fs::read(wal_path(&path)).unwrap();
-    assert!(wal.len() > 2_000_000, "WAL should hold the old database");
-    drop(conn);
-    drop(db);
-    wal
+    assert!(table_names(&conn).is_empty());
+    assert_eq!(integrity_check(&conn), "ok");
 }
 
-/// Places `wal` as `{db_path}-wal`, with `db` as the db file (absent if
-/// `None`).
-fn place_files(db_path: &Path, db: Option<&[u8]>, wal: &[u8]) {
-    let _ = std::fs::remove_file(db_path);
-    if let Some(db) = db {
-        std::fs::write(db_path, db).unwrap();
-    }
-    std::fs::write(wal_path(db_path), wal).unwrap();
+fn table_names(conn: &Arc<Connection>) -> Vec<String> {
+    query_rows(conn, "SELECT name FROM sqlite_schema ORDER BY name")
+        .into_iter()
+        .map(|row| row[0].to_text().unwrap().to_string())
+        .collect()
 }
 
-const OLD_TABLES: [&str; 3] = ["old_t", "old_u", "old_v"];
+fn integrity_check(conn: &Arc<Connection>) -> String {
+    query_rows(conn, "PRAGMA integrity_check")[0][0]
+        .to_text()
+        .unwrap()
+        .to_string()
+}
+
+fn query_i64(conn: &Arc<Connection>, sql: &str) -> i64 {
+    match query_rows(conn, sql)[0][0] {
+        Value::Numeric(Numeric::Integer(value)) => value,
+        ref other => panic!("expected an integer from {sql}, got {other:?}"),
+    }
+}
+
+fn query_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let mut rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        rows.push(row.get_values().cloned().collect());
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+#[cfg(all(
+    host_shared_wal,
+    any(not(target_os = "windows"), feature = "experimental_win_iocp")
+))]
+fn wait_for_file(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Event {
+enum IoEvent {
     DbWrite,
     DbSync,
     WalWrite,
-    DirSync,
+    ParentDirSync,
+    RemoveFile,
 }
 
-/// Wraps the platform IO, recording db/WAL writes and syncs and
-/// `sync_parent_dir` calls, modelled on `SyncCountingIo` in `vdbe/vacuum.rs`.
-struct CountingIo {
+struct RecordingIo {
     inner: Arc<dyn IO>,
     db_path: String,
     wal_path: String,
-    events: Arc<Mutex<Vec<Event>>>,
-    dir_sync_unsupported: bool,
+    supports_parent_dir_sync: bool,
+    events: Arc<Mutex<Vec<IoEvent>>>,
 }
 
-impl CountingIo {
-    fn new(db_path: &Path, dir_sync_unsupported: bool) -> Arc<Self> {
+impl RecordingIo {
+    fn new(paths: &DbPaths, supports_parent_dir_sync: bool) -> Arc<Self> {
         Arc::new(Self {
             inner: platform_io(),
-            db_path: db_path.to_str().unwrap().to_string(),
-            wal_path: wal_path(db_path).to_str().unwrap().to_string(),
+            db_path: paths.db.to_str().unwrap().to_string(),
+            wal_path: paths.wal.to_str().unwrap().to_string(),
+            supports_parent_dir_sync,
             events: Arc::new(Mutex::new(Vec::new())),
-            dir_sync_unsupported,
         })
     }
 
-    fn take_events(&self) -> Vec<Event> {
-        std::mem::take(&mut *self.events.lock())
+    fn events(&self) -> Vec<IoEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn count(&self, event: IoEvent) -> usize {
+        self.events().into_iter().filter(|e| *e == event).count()
+    }
+
+    fn clear(&self) {
+        self.events.lock().unwrap().clear();
     }
 }
 
-impl Clock for CountingIo {
+impl Clock for RecordingIo {
     fn current_time_monotonic(&self) -> MonotonicInstant {
         self.inner.current_time_monotonic()
     }
@@ -146,26 +694,33 @@ impl Clock for CountingIo {
     }
 }
 
-impl IO for CountingIo {
+impl IO for RecordingIo {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         let inner = self.inner.open_file(path, flags, direct)?;
-        Ok(Arc::new(CountingFile {
+        let kind = if path == self.db_path {
+            RecordedFile::Db
+        } else if path == self.wal_path {
+            RecordedFile::Wal
+        } else {
+            RecordedFile::Other
+        };
+        Ok(Arc::new(RecordingFile {
             inner,
-            is_db: path == self.db_path,
-            tracked: path == self.db_path || path == self.wal_path,
+            kind,
             events: self.events.clone(),
         }))
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        self.events.lock().unwrap().push(IoEvent::RemoveFile);
         self.inner.remove_file(path)
     }
 
     fn sync_parent_dir(&self, path: &str, c: Completion) -> Result<Completion> {
-        if self.dir_sync_unsupported {
+        if !self.supports_parent_dir_sync {
             return Err(LimboError::IoExtensionUnsupported("sync_parent_dir"));
         }
-        self.events.lock().push(Event::DirSync);
+        self.events.lock().unwrap().push(IoEvent::ParentDirSync);
         self.inner.sync_parent_dir(path, c)
     }
 
@@ -181,31 +736,36 @@ impl IO for CountingIo {
         self.inner.cancel(completions)
     }
 
-    fn file_id(&self, path: &str) -> Result<io::FileId> {
+    fn file_id(&self, path: &str) -> Result<FileId> {
         self.inner.file_id(path)
     }
 }
 
-struct CountingFile {
-    inner: Arc<dyn File>,
-    is_db: bool,
-    tracked: bool,
-    events: Arc<Mutex<Vec<Event>>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedFile {
+    Db,
+    Wal,
+    Other,
 }
 
-impl CountingFile {
+struct RecordingFile {
+    inner: Arc<dyn File>,
+    kind: RecordedFile,
+    events: Arc<Mutex<Vec<IoEvent>>>,
+}
+
+impl RecordingFile {
     fn record_write(&self) {
-        if self.tracked {
-            self.events.lock().push(if self.is_db {
-                Event::DbWrite
-            } else {
-                Event::WalWrite
-            });
-        }
+        let event = match self.kind {
+            RecordedFile::Db => IoEvent::DbWrite,
+            RecordedFile::Wal => IoEvent::WalWrite,
+            RecordedFile::Other => return,
+        };
+        self.events.lock().unwrap().push(event);
     }
 }
 
-impl File for CountingFile {
+impl File for RecordingFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {
         self.inner.lock_file(exclusive)
     }
@@ -229,8 +789,8 @@ impl File for CountingFile {
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
-        if self.tracked && self.is_db {
-            self.events.lock().push(Event::DbSync);
+        if self.kind == RecordedFile::Db {
+            self.events.lock().unwrap().push(IoEvent::DbSync);
         }
         self.inner.sync(c, sync_type)
     }
@@ -242,397 +802,4 @@ impl File for CountingFile {
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
         self.inner.truncate(len, c)
     }
-}
-
-fn count(events: &[Event], event: Event) -> usize {
-    events.iter().filter(|e| **e == event).count()
-}
-
-#[test]
-fn replay_resurrects_orphan_wal_without_extra_syncs() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_wal = build_old_wal(dir.path());
-    let path = dir.path().join("g.db");
-    place_files(&path, None, &old_wal);
-
-    let io = CountingIo::new(&path, false);
-    let db = open_with(
-        io.clone(),
-        &path,
-        OpenFlags::default(),
-        OrphanWalPolicy::Replay,
-    )
-    .unwrap();
-    let conn = db.connect().unwrap();
-    assert!(schema_names(&conn).is_empty());
-    assert!(conn.prepare("SELECT * FROM old_t").is_err());
-    rolled_back_write(&conn);
-    assert_eq!(file_len(&path), Some(4096));
-
-    let events = io.take_events();
-    assert_eq!(count(&events, Event::DirSync), 0, "{events:?}");
-    assert_eq!(count(&events, Event::DbSync), 0, "{events:?}");
-    assert_eq!(file_len(&wal_path(&path)), Some(old_wal.len() as u64));
-
-    let conn2 = db.connect().unwrap();
-    assert_eq!(schema_names(&conn2), OLD_TABLES);
-    assert_eq!(query_strings(&conn2, "SELECT count(*) FROM old_t"), ["300"]);
-    drop(conn2);
-    drop(conn);
-    drop(db);
-
-    let db = open_rw(&path, OrphanWalPolicy::Replay).unwrap();
-    let conn = db.connect().unwrap();
-    assert_eq!(schema_names(&conn), OLD_TABLES);
-    assert_eq!(query_strings(&conn, "SELECT count(*) FROM old_t"), ["300"]);
-    assert_eq!(integrity_check(&conn), ["ok"]);
-}
-
-/// Opens `path` under `policy`, checks the schema is empty, allocates page 1
-/// without committing, reopens and checks the db is still empty.
-fn assert_discarded(path: &Path, policy: OrphanWalPolicy) {
-    let db = open_rw(path, policy).unwrap();
-    assert_eq!(file_len(&wal_path(path)), Some(0), "WAL must be discarded");
-    let conn = db.connect().unwrap();
-    assert!(schema_names(&conn).is_empty());
-    rolled_back_write(&conn);
-    let conn2 = db.connect().unwrap();
-    assert!(schema_names(&conn2).is_empty());
-    drop(conn2);
-    drop(conn);
-    drop(db);
-
-    let db = open_rw(path, policy).unwrap();
-    let conn = db.connect().unwrap();
-    assert!(schema_names(&conn).is_empty());
-    assert_eq!(integrity_check(&conn), ["ok"]);
-}
-
-#[test]
-fn discard_zero_bytes_discards_orphan_wal_beside_absent_or_empty_db() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_wal = build_old_wal(dir.path());
-    let policy = discard(EmptyDb::ZeroBytes, ReadOnlyOrphanWal::Ignore);
-
-    let absent = dir.path().join("absent.db");
-    place_files(&absent, None, &old_wal);
-    assert_discarded(&absent, policy);
-
-    let empty = dir.path().join("empty.db");
-    place_files(&empty, Some(&[]), &old_wal);
-    assert_discarded(&empty, policy);
-
-    // A 1-byte db is not empty under `ZeroBytes`: the WAL is left alone.
-    let one = dir.path().join("one.db");
-    place_files(&one, Some(&[0]), &old_wal);
-    let _ = open_rw(&one, policy);
-    assert_eq!(std::fs::read(wal_path(&one)).unwrap(), old_wal);
-    assert_eq!(file_len(&one), Some(1));
-}
-
-#[test]
-fn discard_one_byte_treats_one_byte_db_as_empty() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_wal = build_old_wal(dir.path());
-    let path = dir.path().join("one.db");
-    place_files(&path, Some(&[0]), &old_wal);
-    let policy = discard(EmptyDb::OneByte, ReadOnlyOrphanWal::Ignore);
-    {
-        let _db = open_rw(&path, policy).unwrap();
-        assert_eq!(file_len(&path), Some(0), "1-byte db must be truncated");
-    }
-    assert_discarded(&path, policy);
-}
-
-#[test]
-fn discard_invalid_header_truncates_invalid_db_with_and_without_wal() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_wal = build_old_wal(dir.path());
-    let policy = discard(EmptyDb::InvalidHeader, ReadOnlyOrphanWal::Ignore);
-    let zeros = vec![0u8; 4096];
-
-    let with_wal = dir.path().join("with_wal.db");
-    place_files(&with_wal, Some(&zeros), &old_wal);
-    {
-        let db = open_rw(&with_wal, policy).unwrap();
-        assert_eq!(file_len(&with_wal), Some(0));
-        assert_eq!(file_len(&wal_path(&with_wal)), Some(0));
-        let conn = db.connect().unwrap();
-        assert!(schema_names(&conn).is_empty());
-    }
-    assert_discarded(&with_wal, policy);
-
-    let no_wal = dir.path().join("no_wal.db");
-    std::fs::write(&no_wal, &zeros).unwrap();
-    let db = open_rw(&no_wal, policy).unwrap();
-    assert_eq!(file_len(&no_wal), Some(0));
-    let conn = db.connect().unwrap();
-    assert!(schema_names(&conn).is_empty());
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    assert_eq!(schema_names(&conn), ["t"]);
-    assert_eq!(integrity_check(&conn), ["ok"]);
-}
-
-#[test]
-fn discard_replays_wal_of_valid_db_under_every_rule() {
-    let dir = tempfile::tempdir().unwrap();
-    let source = dir.path().join("source.db");
-    let (db_bytes, wal_bytes) = {
-        let db = open_rw(&source, OrphanWalPolicy::Replay).unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        for i in 0..10 {
-            conn.execute(format!("INSERT INTO t VALUES ({i})")).unwrap();
-        }
-        (
-            std::fs::read(&source).unwrap(),
-            std::fs::read(wal_path(&source)).unwrap(),
-        )
-    };
-    assert!(!db_bytes.is_empty());
-    assert!(!wal_bytes.is_empty());
-
-    for rule in DISCARD_RULES {
-        let path = dir.path().join(format!("{rule:?}.db"));
-        place_files(&path, Some(&db_bytes), &wal_bytes);
-        let db = open_rw(&path, discard(rule, ReadOnlyOrphanWal::Ignore)).unwrap();
-        let conn = db.connect().unwrap();
-        assert_eq!(schema_names(&conn), ["t"], "{rule:?}");
-        assert_eq!(query_strings(&conn, "SELECT count(*) FROM t"), ["10"]);
-        assert_eq!(integrity_check(&conn), ["ok"]);
-    }
-}
-
-#[test]
-fn discard_read_only_never_modifies_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_wal = build_old_wal(dir.path());
-    let ro = OpenFlags::ReadOnly;
-
-    // Ignore: empty schema, WAL untouched.
-    for (name, db, rule) in [
-        ("zero.db", &[][..], EmptyDb::ZeroBytes),
-        ("one.db", &[0u8][..], EmptyDb::OneByte),
-    ] {
-        let path = dir.path().join(name);
-        place_files(&path, Some(db), &old_wal);
-        let db_handle = open_with(
-            platform_io(),
-            &path,
-            ro,
-            discard(rule, ReadOnlyOrphanWal::Ignore),
-        )
-        .unwrap();
-        let conn = db_handle.connect().unwrap();
-        assert!(schema_names(&conn).is_empty(), "{name}");
-        drop(conn);
-        drop(db_handle);
-        assert_eq!(std::fs::read(&path).unwrap(), db, "{name}");
-        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), old_wal, "{name}");
-    }
-
-    // Replay: same as upstream (the default policy).
-    let path = dir.path().join("replay.db");
-    place_files(&path, Some(&[]), &old_wal);
-    let upstream = {
-        let db = open_with(platform_io(), &path, ro, OrphanWalPolicy::Replay).unwrap();
-        let conn = db.connect().unwrap();
-        schema_names(&conn)
-    };
-    let replayed = {
-        let db = open_with(
-            platform_io(),
-            &path,
-            ro,
-            discard(EmptyDb::ZeroBytes, ReadOnlyOrphanWal::Replay),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        schema_names(&conn)
-    };
-    assert_eq!(replayed, upstream);
-    assert_eq!(file_len(&path), Some(0));
-    assert_eq!(std::fs::read(wal_path(&path)).unwrap(), old_wal);
-
-    // InvalidHeader: an invalid header fails the open, whatever `read_only`.
-    for read_only in [ReadOnlyOrphanWal::Ignore, ReadOnlyOrphanWal::Replay] {
-        for (name, db) in [("zeros.db", vec![0u8; 4096]), ("short.db", vec![7u8; 50])] {
-            let path = dir.path().join(name);
-            place_files(&path, Some(&db), &old_wal);
-            let err = open_with(
-                platform_io(),
-                &path,
-                ro,
-                discard(EmptyDb::InvalidHeader, read_only),
-            )
-            .unwrap_err();
-            assert!(err.to_string().contains("valid header"), "{err}");
-            assert_eq!(std::fs::read(&path).unwrap(), db);
-            assert_eq!(std::fs::read(wal_path(&path)).unwrap(), old_wal);
-        }
-    }
-}
-
-#[test]
-fn discard_makes_page1_durable_before_first_wal_frame() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("durable.db");
-    let io = CountingIo::new(&path, false);
-    let db = open_with(
-        io.clone(),
-        &path,
-        OpenFlags::default(),
-        discard(EmptyDb::ZeroBytes, ReadOnlyOrphanWal::Ignore),
-    )
-    .unwrap();
-    let open_events = io.take_events();
-    assert_eq!(open_events, [Event::DirSync], "open probes sync_parent_dir");
-
-    let conn = db.connect().unwrap();
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    let events = io.take_events();
-    let first_wal_write = events
-        .iter()
-        .position(|e| *e == Event::WalWrite)
-        .expect("commit must write the WAL");
-    assert_eq!(
-        &events[..first_wal_write],
-        [Event::DbWrite, Event::DbSync, Event::DirSync],
-        "page 1 must be written, synced and its directory entry synced before any WAL frame: {events:?}"
-    );
-}
-
-#[test]
-fn discard_fails_open_of_empty_db_when_sync_parent_dir_unsupported() {
-    let dir = tempfile::tempdir().unwrap();
-    let policy = discard(EmptyDb::ZeroBytes, ReadOnlyOrphanWal::Ignore);
-
-    let empty = dir.path().join("empty.db");
-    let io = CountingIo::new(&empty, true);
-    let err = open_with(io, &empty, OpenFlags::default(), policy).unwrap_err();
-    assert!(
-        matches!(err, LimboError::IoExtensionUnsupported("sync_parent_dir")),
-        "{err:?}"
-    );
-
-    let existing = dir.path().join("existing.db");
-    {
-        let db = open_rw(&existing, OrphanWalPolicy::Replay).unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE t(x)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-    }
-    let io = CountingIo::new(&existing, true);
-    let db = open_with(io, &existing, OpenFlags::default(), policy).unwrap();
-    let conn = db.connect().unwrap();
-    assert_eq!(query_strings(&conn, "SELECT x FROM t"), ["1"]);
-    conn.execute("INSERT INTO t VALUES (2)").unwrap();
-}
-
-#[test]
-fn discard_rejects_registry_bypassed_opens() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bypass.db");
-    let path_str = path.to_str().unwrap();
-    let io = platform_io();
-    let file = io.open_file(path_str, OpenFlags::default(), false).unwrap();
-    let mut state = OpenDbAsyncState::new();
-    let err = Database::open_with_flags_bypass_registry_async(
-        &mut state,
-        io,
-        path_str,
-        None,
-        Arc::new(DatabaseFile::new(file)),
-        OpenFlags::default(),
-        DatabaseOpts::new()
-            .with_orphan_wal_policy(discard(EmptyDb::ZeroBytes, ReadOnlyOrphanWal::Ignore)),
-        None,
-        None,
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("registry-bypassed"), "{err}");
-}
-
-#[cfg(all(host_shared_wal, unix))]
-const MULTIPROCESS_HOLD_CHILD_TEST: &str =
-    "orphan_wal_tests::multiprocess_orphan_wal_child_process";
-
-#[cfg(all(host_shared_wal, unix))]
-fn open_multiprocess(path: &Path, policy: OrphanWalPolicy) -> Result<Arc<Database>> {
-    Database::open_file_with_flags(
-        platform_io(),
-        path.to_str().unwrap(),
-        OpenFlags::default(),
-        DatabaseOpts::new()
-            .with_multiprocess_wal(true)
-            .with_orphan_wal_policy(policy),
-        None,
-    )
-}
-
-#[cfg(all(host_shared_wal, unix))]
-fn wait_for_file(path: &Path) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !path.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
-#[cfg(all(host_shared_wal, unix))]
-#[test]
-fn discard_under_multiprocess_wal_fails_when_another_process_is_attached() {
-    let dir = tempfile::tempdir().unwrap();
-    let old_wal = build_old_wal(dir.path());
-    let path = dir.path().join("mp.db");
-    place_files(&path, None, &old_wal);
-    let ready = dir.path().join("ready");
-    let release = dir.path().join("release");
-
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .arg(MULTIPROCESS_HOLD_CHILD_TEST)
-        .arg("--exact")
-        .arg("--nocapture")
-        .env("TURSO_ORPHAN_WAL_DB_PATH", &path)
-        .env("TURSO_ORPHAN_WAL_READY_FILE", &ready)
-        .env("TURSO_ORPHAN_WAL_RELEASE_FILE", &release)
-        .spawn()
-        .unwrap();
-    wait_for_file(&ready);
-
-    let policy = discard(EmptyDb::ZeroBytes, ReadOnlyOrphanWal::Ignore);
-    let result = open_multiprocess(&path, policy);
-    std::fs::write(&release, b"release").unwrap();
-    let status = child.wait().unwrap();
-    assert!(status.success(), "child failed: {status:?}");
-
-    let err = result.unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("orphan WAL"), "{msg}");
-    assert!(msg.contains("another process is attached"), "{msg}");
-    assert!(msg.contains(wal_path(&path).to_str().unwrap()), "{msg}");
-    assert_eq!(std::fs::read(wal_path(&path)).unwrap(), old_wal);
-
-    // With no peer attached the authority is exclusive and discard proceeds.
-    let db = open_multiprocess(&path, policy).unwrap();
-    assert_eq!(file_len(&wal_path(&path)), Some(0));
-    let conn = db.connect().unwrap();
-    assert!(schema_names(&conn).is_empty());
-}
-
-#[cfg(all(host_shared_wal, unix))]
-#[test]
-fn multiprocess_orphan_wal_child_process() {
-    let Some(db_path) = std::env::var_os("TURSO_ORPHAN_WAL_DB_PATH") else {
-        return;
-    };
-    let ready = std::env::var_os("TURSO_ORPHAN_WAL_READY_FILE").unwrap();
-    let release = std::env::var_os("TURSO_ORPHAN_WAL_RELEASE_FILE").unwrap();
-    let _db = open_multiprocess(Path::new(&db_path), OrphanWalPolicy::Replay).unwrap();
-    std::fs::write(&ready, b"ready").unwrap();
-    wait_for_file(Path::new(&release));
 }

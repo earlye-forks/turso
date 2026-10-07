@@ -19,7 +19,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -30,7 +30,7 @@ use crate::{
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn, RegisterOrLiteral},
+        insn::{IdxInsertFlags, Insn, RegisterOrLiteral, SorterOpenData},
     },
 };
 use rustc_hash::FxHashMap as HashMap;
@@ -65,9 +65,6 @@ fn validate(
         bail_parse_error!(
             "index method is an experimental feature. Enable with --experimental-index-method flag"
         )
-    }
-    if connection.mvcc_enabled() && using.is_some() {
-        bail_parse_error!("Custom index modules are not supported in MVCC mode");
     }
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
@@ -107,13 +104,14 @@ pub fn translate_create_index(
     };
 
     let original_idx_name = idx_name;
+    let original_tbl_name = tbl_name;
     let database_id = if original_idx_name.db_name.is_some() {
         resolver.resolve_database_id(&original_idx_name)?
     } else {
-        resolver.resolve_existing_table_database_id(tbl_name.as_str())?
+        resolver.resolve_existing_table_database_id(original_tbl_name.as_str())?
     };
     let idx_name = normalize_ident(original_idx_name.name.as_str());
-    let tbl_name = normalize_ident(tbl_name.as_str());
+    let tbl_name = normalize_ident(original_tbl_name.as_str());
 
     validate(
         &tbl_name,
@@ -137,14 +135,24 @@ pub fn translate_create_index(
         if if_not_exists {
             return Ok(());
         }
-        crate::bail_parse_error!("Error: index with name '{idx_name}' already exists.");
+        crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
+        if resolver.with_schema(database_id, |s| {
+            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+        }) {
+            crate::bail_parse_error!("views may not be indexed");
+        }
+        // The index's target table always lives in the index's own database,
+        // so SQLite qualifies the missing table with that database name.
+        let db_name = resolver
+            .get_database_name_by_index(database_id)
+            .unwrap_or_else(|| "main".to_string());
+        crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
     let Some(tbl) = table.btree() else {
-        crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
+        crate::bail_parse_error!("virtual tables may not be indexed");
     };
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
@@ -294,6 +302,7 @@ pub fn translate_create_index(
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
+        trigger_target_database_id: None,
     });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {
@@ -310,7 +319,7 @@ pub fn translate_create_index(
 /// records have been collected and sorted. Statement journaling is therefore required
 /// around REINDEX callers so any later refill error restores the original index b-tree.
 #[allow(clippy::too_many_arguments)]
-fn emit_refill_index(
+pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
@@ -338,6 +347,7 @@ fn emit_refill_index(
                 iter_dir: IterationDirection::Forwards,
                 index: None,
             }),
+            unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
             identifier: tbl_name.clone(),
             internal_id: table_ref,
@@ -347,10 +357,11 @@ fn emit_refill_index(
             expression_index_usages: Vec::new(),
             database_id,
             indexed: None,
+            plan_estimate: None,
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver);
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), resolver)?;
 
     if idx
         .index_method
@@ -416,9 +427,9 @@ fn emit_refill_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(start_reg),
+            count: to_u32(columns.len() + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
         });
@@ -427,7 +438,7 @@ fn emit_refill_index(
             cursor_id: index_cursor_id,
             record_reg,
             unpacked_start: Some(start_reg),
-            unpacked_count: Some((columns.len() + 1) as u16),
+            unpacked_count: Some((columns.len() + 1) as u32),
             flags: IdxInsertFlags::new().use_seek(false),
         });
 
@@ -437,20 +448,26 @@ fn emit_refill_index(
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
+            fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else {
         let order_collations_nulls = idx
             .columns
             .iter()
-            .map(|c| (c.order, c.collation, None))
+            .map(|c| (c.order, c.collation, c.nulls_order))
             .try_collect()?;
         program.emit_insn(Insn::SorterOpen {
-            cursor_id: sorter_cursor_id,
-            columns: columns.len(),
-            order_collations_nulls,
-            comparators: crate::alloc::vec![],
+            data: Box::new(SorterOpenData {
+                cursor_id: sorter_cursor_id,
+                columns: columns.len(),
+                order_collations_nulls,
+                comparators: crate::alloc::vec![],
+            }),
         });
+        // SorterData moves each sorted record into the pseudo cursor's
+        // content register; the two must name the same register.
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
             cursor_id: pseudo_cursor_id,
@@ -511,9 +528,9 @@ fn emit_refill_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(columns.len() + 1),
-            dest_reg: to_u16(record_reg),
+            start_reg: to_u32(start_reg),
+            count: to_u32(columns.len() + 1),
+            dest_reg: to_u32(record_reg),
             index_name: Some(idx.name.clone()),
             affinity_str: None,
         });
@@ -528,6 +545,8 @@ fn emit_refill_index(
         program.emit_insn(Insn::Next {
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
+            fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(loop_end_label);
 
@@ -535,6 +554,7 @@ fn emit_refill_index(
             program.emit_insn(Insn::ClearBtree {
                 db: database_id,
                 root,
+                count: ClearBtreeCount::Nothing,
             });
         }
         program.emit_insn(Insn::OpenWrite {
@@ -551,8 +571,6 @@ fn emit_refill_index(
             pc_if_empty: sorted_loop_end,
         });
 
-        let sorted_record_reg = program.alloc_register();
-
         if idx.unique {
             let goto_label = program.allocate_label();
             let label_after_sorter_compare = program.allocate_label();
@@ -563,7 +581,7 @@ fn emit_refill_index(
             program.preassign_label_to_next_insn(sorted_loop_start);
             program.emit_insn(Insn::SorterCompare {
                 cursor_id: sorter_cursor_id,
-                sorted_record_reg,
+                sorted_record_reg: content_reg,
                 num_regs: columns.len(),
                 pc_when_nonequal: goto_label,
             });
@@ -581,7 +599,7 @@ fn emit_refill_index(
         program.emit_insn(Insn::SorterData {
             pseudo_cursor: pseudo_cursor_id,
             cursor_id: sorter_cursor_id,
-            dest_reg: sorted_record_reg,
+            dest_reg: content_reg,
         });
 
         program.emit_insn(Insn::SeekEnd {
@@ -589,7 +607,7 @@ fn emit_refill_index(
         });
         program.emit_insn(Insn::IdxInsert {
             cursor_id: index_cursor_id,
-            record_reg: sorted_record_reg,
+            record_reg: content_reg,
             unpacked_start: None,
             unpacked_count: None,
             flags: IdxInsertFlags::new().use_seek(false),
@@ -687,16 +705,21 @@ fn resolve_reindex_targets(
 
     let normalized_name = normalize_ident(name.name.as_str());
     if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
-            return Ok(collect_reindex_targets_by_collation(
-                resolver, connection, collation,
-            ));
+        let collation = CollationSeq::new(&normalized_name).ok();
+        if let Some(collation) = collation {
+            let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
+            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+                return Ok(targets);
+            }
         }
         if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
             return Ok(targets);
         }
         if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
             return Ok(vec![target]);
+        }
+        if collation.is_some() {
+            return Ok(Vec::new());
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
@@ -882,6 +905,15 @@ pub fn resolve_sorted_columns(
     resolve_sorted_columns_with_resolver(table, cols, None)
 }
 
+pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
+    for sc in cols {
+        if let Some(nulls) = sc.nulls {
+            crate::bail_parse_error!("unsupported use of {}", nulls);
+        }
+    }
+    Ok(())
+}
+
 fn resolve_sorted_columns_with_resolver(
     table: &BTreeTable,
     cols: &[SortedColumn],
@@ -893,6 +925,7 @@ fn resolve_sorted_columns_with_resolver(
         )?;
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
+        let nulls = sc.nulls;
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
@@ -906,6 +939,7 @@ fn resolve_sorted_columns_with_resolver(
                 .push_within_capacity(IndexColumn {
                     name: column_name,
                     order,
+                    nulls_order: nulls,
                     pos_in_table: pos,
                     collation,
                     default: column.default.clone(),
@@ -921,6 +955,7 @@ fn resolve_sorted_columns_with_resolver(
             .push_within_capacity(IndexColumn {
                 name: sc.expr.to_string(),
                 order,
+                nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,
@@ -1151,17 +1186,9 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
-                    b.as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
-                        })
-                        .collect(),
-                ),
+                ast::Literal::Blob(b) => {
+                    crate::Value::Blob(ast::blob_literal_bytes(&b).try_collect()?)
+                }
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
             _ => bail_parse_error!("parameters must be constant literals"),
@@ -1305,7 +1332,6 @@ pub fn translate_drop_index(
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-                sqlite_table.is_strict,
             ))
         } else {
             None
@@ -1333,6 +1359,8 @@ pub fn translate_drop_index(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
+        fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(loop_end_label);

@@ -4,7 +4,7 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use super::collate::{resolve_comparison_collseq_with_resolver, CollationSeq};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
@@ -15,12 +15,11 @@ use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{
-    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Table, Type, TypeDef,
+    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
+    ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
-use crate::translate::expression_index::{
-    normalize_expr_for_index_matching, single_table_column_usage,
-};
+use crate::translate::expression_index::selected_expression_index;
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -80,14 +79,14 @@ use vectors::*;
 use walk::*;
 
 pub(crate) use affinity::{
-    compare_affinity, expr_data_type, get_expr_affinity_info, ExprAffinityInfo, StorageClassMask,
+    comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
 };
-pub use affinity::{comparison_affinity, get_expr_affinity};
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
 pub(crate) use binary::expr_is_array;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
@@ -106,10 +105,12 @@ pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
 };
 pub use utils::{
-    as_binary_components, maybe_apply_affinity, sanitize_string, unwrap_parens, unwrap_parens_owned,
+    as_binary_components, maybe_apply_affinity, sanitize_string, truth_test_rhs, unwrap_parens,
+    unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
 pub use walk::{
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
+    expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
+    walk_expr, walk_expr_mut, WalkControl,
 };

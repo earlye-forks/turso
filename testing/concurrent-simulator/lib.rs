@@ -16,11 +16,13 @@ use std::fmt::Write;
 use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
+use turso_core::SqliteDialect;
 #[cfg(target_os = "windows")]
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
 use turso_core::{
-    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement, Value,
+    CheckpointMode, CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, LimboError,
+    OpenFlags, Statement, Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
@@ -29,6 +31,7 @@ pub mod chaotic_btree;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
+pub mod fts;
 mod io;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod multiprocess;
@@ -296,12 +299,24 @@ pub struct WhopperOpts {
     /// If true, MVCC's auto-checkpoint is disabled on the Database immediately after open.
     /// Recovery bugs need uncheckpointed schema rows to remain in the logical log to exercise recovery.
     pub disable_mvcc_auto_checkpoint: bool,
+    /// If set, overrides the MVCC auto-checkpoint threshold (bytes of logical log) on the
+    /// Database immediately after open. A small value makes checkpoints fire often enough for
+    /// short runs to exercise them. Ignored when `disable_mvcc_auto_checkpoint` is true.
+    pub mvcc_checkpoint_threshold: Option<i64>,
     /// If false, don't close connections before dropping them
     pub close_connections_gracefully: bool,
     /// Probabilty of a reopen fault.
     pub reopen_probability: f64,
     /// Probability of failing a scoped Turso allocation while stepping a statement.
     pub allocation_fault_probability: f64,
+    /// Probability that, on a step where the chosen fiber's statement is
+    /// suspended mid-execution, the simulator attempts a checkpoint on that
+    /// same connection (PRAGMA wal_checkpoint or the Connection::checkpoint
+    /// API, chosen at random) and asserts the engine rejects it. Checkpoints
+    /// invalidate the connection's cursors and page cache, so allowing one
+    /// would break the suspended statement.
+    pub checkpoint_probe_probability: f64,
+    pub fts_profile: Option<fts::FtsProfile>,
 }
 
 /// Schema-generation bias
@@ -347,9 +362,12 @@ impl Default for WhopperOpts {
             chaotic_profiles: vec![],
             schema_bias: SchemaBias::default(),
             disable_mvcc_auto_checkpoint: false,
+            mvcc_checkpoint_threshold: None,
             close_connections_gracefully: true,
             reopen_probability: 0.0,
             allocation_fault_probability: 0.0,
+            checkpoint_probe_probability: 0.01,
+            fts_profile: None,
         }
     }
 }
@@ -465,6 +483,11 @@ impl WhopperOpts {
         self
     }
 
+    pub fn with_mvcc_checkpoint_threshold(mut self, threshold: Option<i64>) -> Self {
+        self.mvcc_checkpoint_threshold = threshold;
+        self
+    }
+
     pub fn with_enable_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
         self
@@ -490,6 +513,11 @@ impl WhopperOpts {
         profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     ) -> Self {
         self.chaotic_profiles = profiles;
+        self
+    }
+
+    pub fn with_checkpoint_probe_probability(mut self, probability: f64) -> Self {
+        self.checkpoint_probe_probability = probability;
         self
     }
 
@@ -531,6 +559,17 @@ pub struct Stats {
     pub corruption_events: usize,
     /// Sequence nextval calls
     pub sequence_nextvals: usize,
+    /// Completed comparisons between FTS results and a table scan
+    pub fts_checks: usize,
+    pub fts_recovery_copies: usize,
+    pub fts_canceled_statements: usize,
+    pub fts_optimize_statements: usize,
+    pub fts_savepoint_rollbacks: usize,
+    pub fts_old_view_reads: usize,
+    pub fts_commits: usize,
+    pub fts_checkpoints: usize,
+    /// Same-connection checkpoint probes fired against suspended statements
+    pub checkpoint_probes: usize,
 }
 
 /// Result of a single simulation step.
@@ -648,16 +687,31 @@ pub struct Whopper {
     chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
     /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
     disable_mvcc_auto_checkpoint: bool,
+    /// If set, overrides the MVCC auto-checkpoint threshold (bytes of logical log) after open.
+    mvcc_checkpoint_threshold: Option<i64>,
     /// Open databases with the experimental non-blocking (passive) MVCC checkpoint enabled.
     experimental_mvcc_passive_checkpoint: bool,
     /// If false, drop fiber connections without first closing them.
     close_connections_gracefully: bool,
     allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
+    /// See [`WhopperOpts::checkpoint_probe_probability`].
+    checkpoint_probe_probability: f64,
+    fts_profile: Option<fts::FtsProfile>,
 }
 
 impl Whopper {
     /// Create a new Whopper simulator with the given options.
     pub fn new(opts: WhopperOpts) -> anyhow::Result<Self> {
+        if opts.fts_profile.is_some() {
+            anyhow::ensure!(
+                !opts.enable_encryption,
+                "FTS profiles do not support encryption"
+            );
+            anyhow::ensure!(
+                opts.max_connections >= 2,
+                "FTS profiles require at least two connections"
+            );
+        }
         let seed = opts.seed.unwrap_or_else(|| {
             let mut rng = rand::rng();
             rng.next_u64()
@@ -701,6 +755,10 @@ impl Whopper {
         let db = {
             let db_opts = DatabaseOpts::new()
                 .with_encryption(encryption_opts.is_some())
+                // Index methods power the FTS workloads; the flag only
+                // gates `CREATE INDEX ... USING` and `OPTIMIZE INDEX`, so
+                // it is safe globally.
+                .with_index_method(true)
                 .with_experimental_mvcc_passive_checkpoint(
                     opts.experimental_mvcc_passive_checkpoint,
                 );
@@ -711,6 +769,7 @@ impl Whopper {
                 OpenFlags::default(),
                 db_opts,
                 encryption_opts.clone(),
+                Arc::new(SqliteDialect),
             ) {
                 Ok(db) => db,
                 Err(e) => {
@@ -807,9 +866,12 @@ impl Whopper {
             stats: Stats::default(),
             chaotic_profiles: opts.chaotic_profiles,
             disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            mvcc_checkpoint_threshold: opts.mvcc_checkpoint_threshold,
             experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
             close_connections_gracefully: opts.close_connections_gracefully,
             allocation_fault_injector,
+            checkpoint_probe_probability: opts.checkpoint_probe_probability,
+            fts_profile: opts.fts_profile,
         };
 
         whopper.open_connections()?;
@@ -837,9 +899,12 @@ impl Whopper {
             return Ok(StepResult::Ok);
         }
 
+        let _cache_override =
+            fts::FtsCacheOverride::new(self.fts_profile == Some(fts::FtsProfile::Snapshots));
         let fiber_idx = self.current_step % self.context.fibers.len();
         self.perform_work(fiber_idx)?;
         self.io.step()?;
+        self.step_fts_faults(fiber_idx)?;
         self.current_step += 1;
 
         if file_size_soft_limit_exceeded(&self.wal_path, self.file_sizes.clone()) {
@@ -847,6 +912,100 @@ impl Whopper {
         }
 
         Ok(StepResult::Ok)
+    }
+
+    /// The fiber's statement is suspended mid-execution. Occasionally try to
+    /// checkpoint the same connection and check the contract the engine
+    /// promises: the checkpoint is refused (running it would invalidate the
+    /// suspended statement's cursors and page cache), and refusal leaves no
+    /// state behind — the suspended statement keeps running on later steps
+    /// and the rest of the workload continues on this connection.
+    ///
+    /// Regression coverage for checkpoints racing suspended statements: on
+    /// unguarded builds the checkpoint runs, and the suspended statement
+    /// either panics on resume, silently loses a write, or silently returns
+    /// wrong rows.
+    fn maybe_probe_checkpoint_on_suspended_statement(
+        &mut self,
+        fiber_idx: usize,
+    ) -> anyhow::Result<()> {
+        if self.checkpoint_probe_probability <= 0.0
+            || !self.rng.random_bool(self.checkpoint_probe_probability)
+        {
+            return Ok(());
+        }
+        self.stats.checkpoint_probes += 1;
+        let connection = self.context.fibers[fiber_idx].connection.clone();
+        // Default-mode MVCC rejects PASSIVE at prepare time (it requires
+        // experimental_mvcc_passive_checkpoint), so probe with a checkpoint
+        // mode the engine's configuration supports — same selection as
+        // WalCheckpointWorkload's allow_passive. The guard must refuse any
+        // mode while a statement is suspended.
+        let passive_allowed =
+            !self.context.enable_mvcc || self.experimental_mvcc_passive_checkpoint;
+        let via_api = self.rng.random_bool(0.5);
+        let outcome: Result<(), LimboError> = if via_api {
+            let mode = if passive_allowed {
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                }
+            } else {
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                }
+            };
+            connection.checkpoint(mode).map(|_| ())
+        } else {
+            // Step the pragma until it resolves, driving any I/O it needs on
+            // the way to the checkpoint opcode (bounded, so an engine bug
+            // cannot hang the simulator).
+            let sql = if passive_allowed {
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            } else {
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            };
+            let mut stmt = connection.prepare(sql)?;
+            let mut budget = 10_000usize;
+            loop {
+                match stmt.step() {
+                    Ok(turso_core::StepResult::IO) => self.io.step()?,
+                    Ok(turso_core::StepResult::Row | turso_core::StepResult::Yield) => {}
+                    Ok(turso_core::StepResult::Done) => break Ok(()),
+                    Ok(other) => {
+                        anyhow::bail!(
+                            "checkpoint probe: step={} fiber={fiber_idx}: unexpected step result {other:?}",
+                            self.current_step
+                        )
+                    }
+                    Err(err) => break Err(err),
+                }
+                budget -= 1;
+                if budget == 0 {
+                    anyhow::bail!(
+                        "checkpoint probe: step={} fiber={fiber_idx}: pragma did not resolve",
+                        self.current_step
+                    );
+                }
+            }
+        };
+        let via = if via_api {
+            "Connection::checkpoint"
+        } else {
+            "PRAGMA wal_checkpoint"
+        };
+        match outcome {
+            Ok(()) => anyhow::bail!(
+                "checkpoint probe: step={} fiber={fiber_idx}: {via} was allowed while \
+                 a statement on the same connection was suspended mid-execution",
+                self.current_step
+            ),
+            Err(LimboError::StatementsInProgress(_) | LimboError::TableLocked) => Ok(()),
+            Err(err) => anyhow::bail!(
+                "checkpoint probe: step={} fiber={fiber_idx}: expected {via} to be \
+                 rejected with StatementsInProgress or TableLocked, got: {err}",
+                self.current_step
+            ),
+        }
     }
 
     fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
@@ -912,6 +1071,7 @@ impl Whopper {
 
         // If the statement has more work, we're done for this simulation step
         if let Ok(None) = step_result {
+            self.maybe_probe_checkpoint_on_suspended_statement(fiber_idx)?;
             return Ok(());
         }
 
@@ -969,6 +1129,9 @@ impl Whopper {
             }
 
             completed_op.finish_op(&mut ctx, &op_result);
+            if self.fts_profile.is_some() && op_result.is_ok() {
+                ctx.stats.record_fts_op(&completed_op);
+            }
 
             for property in &self.properties {
                 let mut property = property.lock().unwrap();
@@ -1181,6 +1344,9 @@ impl Whopper {
                 StepResult::WalSizeLimitExceeded => break,
             }
         }
+        if self.fts_profile.is_some() {
+            self.reopen()?;
+        }
         self.finalize_properties()?;
         Ok(())
     }
@@ -1195,6 +1361,13 @@ impl Whopper {
     }
 
     /// Dump database files to simulator-output directory.
+    /// The database files the simulated IO holds, keyed by suffix (`.db`,
+    /// `-wal`, `-log`) so two runs can be compared without their unique
+    /// path prefix.
+    pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        self.io.db_file_bytes()
+    }
+
     pub fn dump_db_files(&self) -> anyhow::Result<()> {
         let out_dir = std::path::PathBuf::from("simulator-output");
         if !out_dir.exists() {
@@ -1248,23 +1421,25 @@ impl Whopper {
         }
     }
 
-    /// Apply an op-finish callback to properties and the operation itself
-    /// for a statement that finished during reopen drain. Mirrors the
-    /// finish-op block of `step()` so the property checker sees drained
-    /// commits and rollbacks rather than silently losing them.
-    fn finalize_drained_statement(&mut self, fiber_idx: usize, op_result: OpResult) {
+    /// Update the operation and compare its results when a statement finishes before reopen.
+    /// Use the same callbacks as `step()` for completed commits and rollbacks.
+    fn finalize_drained_statement(
+        &mut self,
+        fiber_idx: usize,
+        op_result: OpResult,
+    ) -> anyhow::Result<()> {
         let fiber = &mut self.context.fibers[fiber_idx];
         let completed_op = fiber.current_op.take();
         let exec_id = fiber.execution_id.take();
         let txn_id = fiber.txn_id;
 
-        // Drop the statement now that we've taken its result.
+        // Drop the statement after taking its result.
         fiber
             .statement
             .replace(None)
             .unwrap()
             .reset()
-            .expect("statement reset should succeed before restart");
+            .expect("statement reset failed before restart");
         let row_count = fiber.rows.len();
         fiber.rows.clear();
 
@@ -1274,14 +1449,13 @@ impl Whopper {
         );
 
         let Some(completed_op) = completed_op else {
-            return;
+            return Ok(());
         };
         let Some(exec_id) = exec_id else {
-            return;
+            return Ok(());
         };
 
-        // Apply state-machine changes (the same call site as step()'s
-        // finish_op block).
+        // Update the simulator state as `step()` does when an operation finishes.
         let current_exec_id = self.context.state.execution_id;
         let mut ctx = OpContext {
             fiber: &mut self.context.fibers[fiber_idx],
@@ -1290,10 +1464,13 @@ impl Whopper {
             rng: &mut self.rng,
         };
         completed_op.finish_op(&mut ctx, &op_result);
+        if self.fts_profile.is_some() && op_result.is_ok() {
+            ctx.stats.record_fts_op(&completed_op);
+        }
 
         for property in &self.properties {
             let mut property = property.lock().unwrap();
-            if let Err(e) = property.finish_op(
+            property.finish_op(
                 self.current_step,
                 fiber_idx,
                 txn_id,
@@ -1301,10 +1478,13 @@ impl Whopper {
                 current_exec_id,
                 &completed_op,
                 &op_result,
-            ) {
-                error!("property failed during drain: {e}");
-            }
+            )?;
         }
+        let fiber = &mut self.context.fibers[fiber_idx];
+        if let Some(workload) = fiber.chaotic_workload.as_mut() {
+            workload.next(Some(fiber.last_chaotic_result.take().unwrap_or(op_result)));
+        }
+        Ok(())
     }
 
     /// Drain in-flight statements on all fibers. Used before reopen.
@@ -1338,7 +1518,7 @@ impl Whopper {
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
                 };
-                self.finalize_drained_statement(fiber_idx, op_result);
+                self.finalize_drained_statement(fiber_idx, op_result)?;
             }
             self.io.step()?;
             drain_iterations += 1;
@@ -1398,6 +1578,7 @@ impl Whopper {
             "Database restarted with {} fibers",
             self.context.fibers.len()
         );
+        self.check_fts_after_reopen()?;
         Ok(())
     }
 
@@ -1520,6 +1701,7 @@ impl Whopper {
     fn open_connections(&mut self) -> anyhow::Result<()> {
         let db_opts = DatabaseOpts::new()
             .with_encryption(self.encryption_opts.is_some())
+            .with_index_method(true)
             .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
         let db = Database::open_file_with_flags(
             self.io.clone(),
@@ -1527,12 +1709,17 @@ impl Whopper {
             OpenFlags::default(),
             db_opts,
             self.encryption_opts.clone(),
+            Arc::new(SqliteDialect),
         )
         .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
 
         if self.disable_mvcc_auto_checkpoint {
             if let Some(mv_store) = db.get_mv_store().as_ref() {
                 mv_store.set_checkpoint_threshold(-1);
+            }
+        } else if let Some(threshold) = self.mvcc_checkpoint_threshold {
+            if let Some(mv_store) = db.get_mv_store().as_ref() {
+                mv_store.set_checkpoint_threshold(threshold);
             }
         }
 

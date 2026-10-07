@@ -1,4 +1,5 @@
 use super::*;
+use crate::DatabaseAllocators;
 use std::{
     ptr::NonNull,
     sync::{
@@ -51,8 +52,10 @@ impl Iterator for UnderreportedLowerBound {
     }
 }
 
+#[derive(Clone)]
 struct CountingAlloc {
     allocations: StdArc<AtomicUsize>,
+    deallocations: StdArc<AtomicUsize>,
 }
 
 unsafe impl ApiAllocator for CountingAlloc {
@@ -62,6 +65,7 @@ unsafe impl ApiAllocator for CountingAlloc {
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.deallocations.fetch_add(1, Ordering::Relaxed);
         unsafe {
             <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
         }
@@ -69,10 +73,36 @@ unsafe impl ApiAllocator for CountingAlloc {
 }
 
 #[test]
+fn database_allocators_preserve_distinct_concrete_types() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let allocators: DatabaseAllocators<Global, CountingAlloc> = DatabaseAllocators {
+        mv_store: Global,
+        fts: CountingAlloc {
+            allocations: allocations.clone(),
+            deallocations: deallocations.clone(),
+        },
+    };
+    let cloned = allocators.clone();
+    let layout = Layout::new::<u64>();
+    let mv_block = cloned.mv_store.allocate(layout).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 0);
+    let fts_block = cloned.fts.allocate(layout).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+    unsafe {
+        allocators.mv_store.deallocate(mv_block.cast(), layout);
+        allocators.fts.deallocate(fts_block.cast(), layout);
+    }
+    assert_eq!(deallocations.load(Ordering::Relaxed), 1);
+}
+
+#[test]
 fn dyn_allocator_delegates_skiplist_allocations() {
     let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
+        deallocations,
     });
     let map: crate::skiplist::SkipMap<i32, i32, _, DynAllocator> =
         crate::skiplist::SkipMap::new_in(alloc);
@@ -85,8 +115,11 @@ fn dyn_allocator_delegates_skiplist_allocations() {
 #[test]
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let fts_allocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
+        deallocations,
     });
     let io = StdArc::new(crate::MemoryIO::new());
     let file = crate::IO::open_file(
@@ -97,15 +130,18 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     )
     .unwrap();
     let db_file = StdArc::new(crate::storage::database::DatabaseFile::new(file));
-    let db = crate::Database::open_with_flags_with_allocator(
+    let db = crate::Database::open(
         io,
         "open-with-allocator.db",
-        db_file,
-        crate::OpenFlags::default(),
-        crate::DatabaseOpts::new(),
-        None,
-        None,
-        alloc,
+        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+            .storage(db_file)
+            .allocators(DatabaseAllocators {
+                mv_store: alloc,
+                fts: DynAllocator::new(CountingAlloc {
+                    allocations: fts_allocations.clone(),
+                    deallocations: StdArc::new(AtomicUsize::new(0)),
+                }),
+            }),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -115,6 +151,86 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
 
     assert!(db.get_mv_store().is_some());
     assert!(allocations.load(Ordering::Relaxed) > 0);
+    assert_eq!(fts_allocations.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(all(nightly, feature = "fts"))]
+#[test]
+fn database_fts_build_and_merge_use_only_the_fts_allocator() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let mv_allocations = StdArc::new(AtomicUsize::new(0));
+    let db = crate::Database::open(
+        StdArc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true))
+            .allocators(DatabaseAllocators {
+                mv_store: DynAllocator::new(CountingAlloc {
+                    allocations: mv_allocations.clone(),
+                    deallocations: StdArc::new(AtomicUsize::new(0)),
+                }),
+                fts: DynAllocator::new(CountingAlloc {
+                    allocations: allocations.clone(),
+                    deallocations: deallocations.clone(),
+                }),
+            }),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for sql in [
+        "INSERT INTO docs VALUES (7, 'hello turso')",
+        "INSERT INTO docs VALUES (19, 'hello world')",
+        "OPTIMIZE INDEX docs_fts",
+    ] {
+        allocations.store(0, Ordering::Relaxed);
+        deallocations.store(0, Ordering::Relaxed);
+        conn.execute(sql).unwrap();
+        assert!(allocations.load(Ordering::Relaxed) > 0, "{sql}");
+        assert_eq!(
+            allocations.load(Ordering::Relaxed),
+            deallocations.load(Ordering::Relaxed),
+            "{sql}"
+        );
+        assert_eq!(mv_allocations.load(Ordering::Relaxed), 0, "{sql}");
+    }
+    let rows = conn
+        .prepare("SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id")
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        std::vec![
+            std::vec![crate::Value::from_i64(7)],
+            std::vec![crate::Value::from_i64(19)]
+        ]
+    );
+}
+
+#[cfg(nightly)]
+#[test]
+fn logical_log_shared_buffer_retains_dyn_allocator() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let alloc = DynAllocator::new(CountingAlloc {
+        allocations: allocations.clone(),
+        deallocations: deallocations.clone(),
+    });
+    let record = crate::mvcc::database::LogRecord::new(1, alloc).unwrap();
+    let data: DynBoxedSlice<u8> = record.buf.into_boxed_slice();
+    let shared = crate::io::SharedBufferData::new(crate::sync::Arc::new(data));
+    let returned = shared.clone();
+
+    assert!(allocations.load(Ordering::Relaxed) > 0);
+    drop(shared);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 0);
+    drop(returned);
+    assert!(deallocations.load(Ordering::Relaxed) > 0);
 }
 
 #[test]
@@ -165,6 +281,13 @@ fn vec_push_within_capacity_returns_value_when_full() {
 
     assert_eq!(values.push_within_capacity(1), Err(1));
     assert!(values.is_empty());
+}
+
+#[test]
+fn try_vec_with_allocator_builds_requested_values() {
+    let values: DynVec<_> = try_vec![7; 3; DynAllocator::default()].unwrap();
+
+    assert_eq!(values.as_slice(), &[7, 7, 7]);
 }
 
 #[test]
@@ -286,6 +409,33 @@ fn iterator_try_collect_builds_result_collection() {
     assert_eq!(error, Err("bad"));
 }
 
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_result_trusted_len_reserves_exact_capacity() {
+    let values = (0..10)
+        .map(Ok::<_, TryReserveError>)
+        .try_collect::<Result<Vec<_>, TryReserveError>>()
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(values.as_slice(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(values.capacity(), values.len());
+}
+
+#[cfg(nightly)]
+#[test]
+fn iterator_try_collect_result_trusted_len_stops_on_error() {
+    let mut consumed = 0;
+    let result = [Ok(1), Err("bad"), Ok(3)]
+        .into_iter()
+        .inspect(|_| consumed += 1)
+        .try_collect::<Result<Vec<_>, &str>>()
+        .unwrap();
+
+    assert_eq!(result, Err("bad"));
+    assert_eq!(consumed, 2);
+}
+
 #[test]
 fn iterator_try_collect_converts_result_error() {
     #[derive(Debug, PartialEq)]
@@ -404,6 +554,16 @@ impl TryClone for FallibleElem {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Err(TryReserveError)
     }
+}
+
+#[test]
+fn try_clone_from_uses_default_replacement() {
+    let source = 7_u32;
+    let mut destination = 3_u32;
+
+    destination.try_clone_from(&source).unwrap();
+
+    assert_eq!(destination, source);
 }
 
 #[test]

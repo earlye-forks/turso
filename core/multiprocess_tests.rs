@@ -1,4 +1,6 @@
 use super::*;
+use crate::storage::database::DatabaseFile;
+use crate::sync::atomic::Ordering;
 use std::process::Command;
 use std::time::Duration;
 
@@ -22,6 +24,8 @@ const MULTIPROCESS_SHM_COUNT_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_count_child_process";
 const MULTIPROCESS_SHM_HOLD_READ_TX_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_hold_read_tx_child_process";
+const MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_shm_db_file_reader_child_process";
 const MULTIPROCESS_SHM_SCHEMA_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_schema_child_process";
 const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
@@ -31,6 +35,8 @@ const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
 const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
+const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_hold_open_child_process";
 
 fn multiprocess_test_io() -> Arc<dyn IO> {
     #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
@@ -132,28 +138,23 @@ fn open_multiprocess_db(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
 }
 
 /// Mimic the sdk-kit async open path: the caller pre-opens the DB file with
-/// NoLock but hands `OpenFlags::default()` to `open_with_flags_async`, so the
-/// async entrypoint itself must re-derive the multiprocess lock mode before
-/// the WAL file is opened.
+/// NoLock but hands `OpenFlags::default()` to `open_async`, so the async
+/// entrypoint itself must re-derive the multiprocess lock mode before the WAL
+/// file is opened.
 fn open_multiprocess_db_async(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
     let file = io.open_file(path, OpenFlags::default() | OpenFlags::NoLock, true)?;
     let db_file = Arc::new(DatabaseFile::new(file));
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .storage(db_file)
+        .db_opts(multiprocess_wal_db_opts());
     let mut state = OpenDbAsyncState::new();
     loop {
-        match Database::open_with_flags_async(
-            &mut state,
-            io.clone(),
-            path,
-            db_file.clone(),
-            OpenFlags::default(),
-            multiprocess_wal_db_opts(),
-            None,
-            None,
-        )? {
+        match Database::open_async(&mut state, io.clone(), path, &options)? {
             IOResult::Done(db) => return Ok(db),
             IOResult::IO(io_completion) => io_completion.wait(&*io)?,
         }
@@ -165,7 +166,14 @@ fn open_multiprocess_db_with_flags(
     path: &str,
     flags: OpenFlags,
 ) -> Result<Arc<Database>> {
-    Database::open_file_with_flags(io, path, flags, multiprocess_wal_db_opts(), None)
+    Database::open_file_with_flags(
+        io,
+        path,
+        flags,
+        multiprocess_wal_db_opts(),
+        None,
+        Arc::new(SqliteDialect),
+    )
 }
 
 #[test]
@@ -255,7 +263,7 @@ fn database_open_without_experimental_multiprocess_wal_uses_in_process_backend()
     let db_path = dir.path().join("coordination-default-off.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = Database::open_file(io, db_path_str).unwrap();
+    let db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -275,7 +283,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_process() 
     let db_path = dir.path().join("coordination-default-locked.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -302,6 +310,7 @@ fn database_open_with_experimental_multiprocess_wal_rejects_unsupported_io_backe
         OpenFlags::default(),
         multiprocess_wal_db_opts(),
         None,
+        Arc::new(SqliteDialect),
     )
     .expect_err("multiprocess WAL should reject IO backends without shared coordination");
     assert!(
@@ -336,7 +345,7 @@ fn multiprocess_wal_rejects_opening_mvcc_database() {
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -361,7 +370,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     let io: Arc<dyn IO> = multiprocess_test_io();
 
     {
-        let db = Database::open_file(io.clone(), db_path_str).unwrap();
+        let db = Database::open_file(io.clone(), db_path_str, Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
@@ -406,7 +415,7 @@ fn database_open_without_experimental_multiprocess_wal_rejects_second_multiproce
         .join("coordination-default-parent-multiprocess-child.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let _db = Database::open_file(io, db_path_str).unwrap();
+    let _db = Database::open_file(io, db_path_str, Arc::new(SqliteDialect)).unwrap();
 
     let current_exe = std::env::current_exe().unwrap();
     let child_output = Command::new(&current_exe)
@@ -463,6 +472,100 @@ fn multiprocess_async_open_child_process() {
     let db = open_multiprocess_db_async(io, db_path.to_str().unwrap()).unwrap();
     let conn = db.connect().unwrap();
     assert_eq!(count_test_rows(&conn), 1);
+}
+
+/// Child half of `reject_live_multiprocess_probe_uses_configured_wal_path`:
+/// open the multiprocess database, hold it open (keeping the authority in
+/// multiprocess mode), signal readiness, and wait for release before exiting.
+#[test]
+fn multiprocess_hold_open_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let last = db.shared_wal.read().last_checksum_and_max_frame();
+    let wal = db.build_wal(last, db.buffer_pool.clone()).unwrap();
+    let wal_file = wal.as_any().downcast_ref::<WalFile>().unwrap();
+    assert_eq!(wal_file.coordination_open_mode_name(), Some("multiprocess"));
+
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+}
+
+/// The legacy/multiprocess probe keys the coordination file off the configured
+/// WAL path, not a hard-coded `{path}-wal`. With a live multiprocess authority
+/// held open by a child process, the probe rejects a legacy open only when it
+/// inspects the WAL path that actually backs the authority; a probe pointed at
+/// a different WAL path finds nothing. Before the fix, the probe hard-coded
+/// `{path}-wal` and so missed the authority whenever a custom WAL path was in
+/// use.
+#[test]
+fn reject_live_multiprocess_probe_uses_configured_wal_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("probe-wal-path.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    // Parent keeps the multiprocess database open so a second (child) opener
+    // flips the authority into multiprocess mode.
+    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_HOLD_OPEN_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_file);
+
+    // Probing the WAL path that actually backs the authority finds it and
+    // rejects a legacy open.
+    let default_wal = format!("{db_path_str}-wal");
+    let err = Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        db_path_str,
+        Some(&default_wal),
+        DatabaseOpts::new(),
+    )
+    .expect_err("legacy open over a live multiprocess authority must be rejected");
+    assert!(
+        matches!(err, LimboError::LockingError(_)),
+        "expected LockingError from the multiprocess probe, got {err:?}"
+    );
+
+    // Probing an unrelated WAL path must NOT reject: the coordination file is
+    // keyed on the WAL path, so the probe must honor its argument.
+    let other_wal = format!("{db_path_str}-other-wal");
+    Database::reject_live_multiprocess_wal_for_legacy_open(
+        &io,
+        db_path_str,
+        Some(&other_wal),
+        DatabaseOpts::new(),
+    )
+    .expect("probe over an unrelated wal path must not reject");
+
+    std::fs::write(&release_file, b"release").unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "hold-open child should exit cleanly after release"
+    );
 }
 
 #[test]
@@ -830,7 +933,7 @@ fn default_locked_db_child_process() {
     };
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let err = Database::open_file(io, db_path.to_str().unwrap())
+    let err = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect))
         .expect_err("default non-multiprocess open should stay DB-file locked across processes");
     assert!(
         matches!(err, LimboError::LockingError(_)),
@@ -966,6 +1069,40 @@ fn multiprocess_shm_hold_read_tx_child_process() {
     wal.end_read_tx();
 }
 
+/// Opens a read transaction while the WAL is fully backfilled, so the
+/// snapshot reads the database file directly, then reports what it sees in
+/// a table it has not touched yet after the parent has changed and
+/// checkpointed that table.
+#[test]
+fn multiprocess_shm_db_file_reader_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let ready_file = std::env::var_os("TURSO_MULTIPROCESS_READY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let release_file = std::env::var_os("TURSO_MULTIPROCESS_RELEASE_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let result_file = std::env::var_os("TURSO_MULTIPROCESS_RESULT_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("begin").unwrap();
+    assert_eq!(count_test_rows(&conn), 1);
+    std::fs::write(&ready_file, b"ready").unwrap();
+    wait_for_file(&release_file);
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    let Value::Text(seen) = &rows[0][0] else {
+        panic!("unexpected row: {rows:?}");
+    };
+    std::fs::write(&result_file, seen.as_str()).unwrap();
+    conn.execute("commit").unwrap();
+}
+
 #[test]
 fn multiprocess_shm_schema_child_process() {
     let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
@@ -1054,6 +1191,7 @@ fn plain_vacuum_rejects_multiprocess_wal_database() {
         OpenFlags::default(),
         multiprocess_wal_db_opts().with_vacuum(true),
         None,
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -1289,6 +1427,50 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
 }
 
 #[test]
+fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir
+        .path()
+        .join("coordination-translated-child-table-use.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let input = "insert into child_table(value) values ('parent-schema')";
+    let (cmd, _) = crate::dialect::sqlite::parse(input).unwrap();
+    let Some(turso_parser::ast::Cmd::Stmt(stmt)) = cmd else {
+        panic!("translated statement input did not parse as a statement");
+    };
+    conn.prepare_translated_stmt(stmt, input)
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+
+    let child_rows =
+        get_rows_without_schema_retry(&conn, "select value from child_table order by rowid");
+    assert_eq!(child_rows.len(), 2);
+    assert_eq!(child_rows[0][0].to_string(), "child-schema");
+    assert_eq!(child_rows[1][0].to_string(), "parent-schema");
+}
+
+#[test]
 fn subprocess_database_open_parent_execute_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("coordination-execute-child-table-use.db");
@@ -1415,6 +1597,211 @@ fn subprocess_readonly_child_reader_blocks_restart_and_truncate_checkpoints() {
         None,
         "shared reader state should clear once the read-only child releases its WAL snapshot"
     );
+}
+
+#[test]
+fn subprocess_db_file_reader_stops_checkpoint_in_other_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(
+        checkpoint.everything_backfilled(),
+        "the child must start its snapshot with nothing left in the WAL"
+    );
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+    assert!(backfilled_frame > 0);
+
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert_eq!(authority.min_active_reader_frame(), None);
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    assert!(
+        authority.has_active_db_file_reader(),
+        "a reader that bypasses the WAL must still be visible to other processes"
+    );
+    assert_eq!(authority.min_active_reader_frame(), None);
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    assert!(wal_max_frame(&conn) > backfilled_frame);
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame past the child's snapshot may reach the database file while it reads"
+    );
+    assert_eq!(checkpoint.wal_total_backfilled, backfilled_frame);
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!authority.has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+}
+
+#[test]
+fn subprocess_db_file_reader_allows_wal_restart_but_stops_backfill() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-db-file-reader-restart.db");
+    let ready_file = dir.path().join("child-ready");
+    let release_file = dir.path().join("child-release");
+    let result_file = dir.path().join("child-result");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("create table other(id integer primary key, value text)")
+        .unwrap();
+    conn.execute("insert into test(id, value) values (1, 'x')")
+        .unwrap();
+    conn.execute("insert into other(id, value) values (1, 'old')")
+        .unwrap();
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    let current_exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_DB_FILE_READER_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .env("TURSO_MULTIPROCESS_READY_FILE", &ready_file)
+        .env("TURSO_MULTIPROCESS_RELEASE_FILE", &release_file)
+        .env("TURSO_MULTIPROCESS_RESULT_FILE", &result_file)
+        .spawn()
+        .unwrap();
+
+    wait_for_file(&ready_file);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    assert!(authority.has_active_db_file_reader());
+
+    conn.execute("update other set value = 'new' where id = 1")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a database file reader in another process must not stop the WAL restart, \
+         but the write appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert_eq!(
+        checkpoint.wal_checkpoint_backfilled, 0,
+        "no frame of the restarted WAL may reach the database file while the child reads"
+    );
+
+    std::fs::write(&release_file, b"release").unwrap();
+    let child_status = child.wait().unwrap();
+    assert!(child_status.success(), "child failed: {child_status:?}");
+    assert_eq!(
+        std::fs::read_to_string(&result_file).unwrap(),
+        "old",
+        "the child's snapshot must not see the update committed after it began"
+    );
+
+    assert!(!authority.has_active_db_file_reader());
+    let checkpoint = conn
+        .checkpoint(CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    assert!(checkpoint.everything_backfilled());
+    let rows = get_rows(&conn, "select value from other where id = 1");
+    assert_eq!(rows[0][0].to_string(), "new");
+}
+
+#[test]
+fn write_after_full_checkpoint_restarts_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-restart-after-checkpoint.db");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    for _ in 0..20 {
+        conn.execute("insert into test(value) values ('x')")
+            .unwrap();
+    }
+    let checkpoint = run_checkpoint(
+        &conn,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    let backfilled_frame = checkpoint.wal_total_backfilled;
+
+    conn.execute("insert into test(value) values ('after')")
+        .unwrap();
+    let max_frame = wal_max_frame(&conn);
+    assert!(
+        max_frame < backfilled_frame,
+        "a write that starts after a full checkpoint must restart the WAL from frame 1, \
+         but it appended at frame {max_frame} after frame {backfilled_frame}"
+    );
+    assert_eq!(count_test_rows(&conn), 21);
 }
 
 #[test]
@@ -1841,7 +2228,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 #[test]
 fn memory_database_keeps_in_process_wal_backend() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
 
     let last_checksum_and_max_frame = db.shared_wal.read().last_checksum_and_max_frame();
     let wal = db
@@ -1854,7 +2241,7 @@ fn memory_database_keeps_in_process_wal_backend() {
 #[test]
 fn memory_database_query_can_close_without_checkpointing() {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     conn.query("VALUES ('ok')").unwrap();
@@ -2653,4 +3040,76 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     );
 
     observer_conn.close().unwrap();
+}
+
+#[test]
+fn checkpoints_and_reads_stay_correct_while_a_reader_holds_a_late_wal_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let io = multiprocess_test_io();
+    let db = open_multiprocess_db(io, dir.path().join("late-reader.db").to_str().unwrap()).unwrap();
+    let readers = [db.connect().unwrap(), db.connect().unwrap()];
+    let writer = db.connect().unwrap();
+    writer.execute("PRAGMA synchronous = NORMAL").unwrap();
+    writer
+        .execute("CREATE TABLE test(id INTEGER PRIMARY KEY, k BLOB UNIQUE, v BLOB)")
+        .unwrap();
+    let insert = "INSERT INTO test(k, v) VALUES(randomblob(16), randomblob(200))";
+
+    readers[0].execute("BEGIN").unwrap();
+    count_test_rows(&readers[0]);
+    let mut open_reader = 0;
+    let mut rows = 0;
+    while wal_max_frame(&writer) < 9000 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+        if rows % 50 == 0 {
+            let next = 1 - open_reader;
+            readers[next].execute("BEGIN").unwrap();
+            assert_eq!(count_test_rows(&readers[next]), rows);
+            readers[open_reader].execute("COMMIT").unwrap();
+            open_reader = next;
+        }
+    }
+
+    let held_reader = &readers[1 - open_reader];
+    held_reader.execute("BEGIN").unwrap();
+    let held_rows = count_test_rows(held_reader);
+    assert_eq!(held_rows, rows);
+    readers[open_reader].execute("COMMIT").unwrap();
+    let held_frame = wal_max_frame(&writer);
+    let passive = CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    };
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+
+    for _ in 0..1500 {
+        writer.execute(insert).unwrap();
+        rows += 1;
+    }
+    assert!(wal_max_frame(&writer) > held_frame + 1000);
+    assert_eq!(count_test_rows(held_reader), held_rows);
+    assert_eq!(count_test_rows(&writer), rows);
+    let authority = db.shared_wal_coordination().unwrap().unwrap();
+    authority.take_frame_index_blocks_scanned_for_tests();
+    let checkpoint = run_checkpoint(&writer, passive);
+    assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+    assert_eq!(checkpoint.wal_checkpoint_backfilled, 0);
+    assert_eq!(authority.take_frame_index_blocks_scanned_for_tests(), 0);
+
+    held_reader.execute("COMMIT").unwrap();
+    let checkpoint = run_checkpoint(
+        &writer,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    assert!(checkpoint.everything_backfilled());
+    assert_eq!(wal_max_frame(&writer), 0);
+    let fresh = db.connect().unwrap();
+    assert_eq!(count_test_rows(&fresh), rows);
+    assert_eq!(
+        get_rows(&fresh, "PRAGMA integrity_check")[0][0].to_string(),
+        "ok"
+    );
 }

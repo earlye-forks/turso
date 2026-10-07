@@ -19,7 +19,7 @@ function timeoutMs(ms: number): Promise<void> {
 }
 
 function normalizeUrl(url: string): string {
-    return url.replace(/^libsql:\/\//, 'https://');
+    return url.replace(/^(libsql|turso):\/\//, 'https://');
 }
 
 async function process(opts: RunOpts, io: ProtocolIo, request: any) {
@@ -49,7 +49,7 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
             const response = await fetchImpl(`${url}${requestType.path}`, {
                 method: requestType.method,
                 headers: headers,
-                body: requestType.body != null ? new Uint8Array(requestType.body) : null,
+                body: requestType.body ?? null,
             });
             completion.status(response.status);
             const reader = response.body?.getReader();

@@ -4,7 +4,7 @@
 </p>
 
 <p align="center">
-  An in-process SQL database, compatible with SQLite.
+  An in-process SQL database, compatible with SQLite, and now with a Postgres frontend too.
 </p>
 
 <p align="center">
@@ -14,6 +14,7 @@
   <a title="JavaScript" target="_blank" href="https://www.npmjs.com/package/@tursodatabase/database"><img alt="NPM" src="https://img.shields.io/npm/v/@tursodatabase/database"></a>
   <a title="Python" target="_blank" href="https://pypi.org/project/pyturso/"><img alt="PyPI" src="https://img.shields.io/pypi/v/pyturso"></a>
   <a title="Java" target="_blank" href="https://central.sonatype.com/artifact/tech.turso/turso"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/tech.turso/turso"></a>
+  <a title=".NET" target="_blank" href="https://www.nuget.org/packages/Turso.Data.Sqlite.Provider"><img alt="NuGet" src="https://img.shields.io/nuget/v/Turso.Data.Sqlite.Provider"></a>
   <a title="MIT" target="_blank" href="https://github.com/tursodatabase/turso/blob/main/LICENSE.md"><img src="http://img.shields.io/badge/license-MIT-orange.svg?style=flat-square"></a>
   <br>
   <a title="GitHub Pull Requests" target="_blank" href="https://github.com/tursodatabase/turso/pulls"><img src="https://img.shields.io/github/issues-pr-closed/tursodatabase/turso.svg?style=flat-square&color=FF9966"></a>
@@ -37,16 +38,22 @@ If you are re-mirroring this fork from a newer upstream release, see the fork's 
 
 ### Fork Features
 
-* **Orphan-WAL policy.** `DatabaseOpts::with_orphan_wal_policy` takes an `OrphanWalPolicy`. The default, `Replay`, keeps upstream behaviour: a leftover `{db}-wal` beside an absent or empty db file is replayed, which brings the old database back on the first write that allocates page 1. `Discard { empty, read_only }` makes read-write opens truncate such an orphan WAL (and, per the `EmptyDb` rule, a 1-byte or invalid-header db file) to 0 bytes instead, and fsyncs page 1 and the db file's parent directory before the first WAL frame of a newly created db. Read-only opens never modify files; `read_only` chooses whether they ignore or replay the orphan WAL. Under experimental multiprocess WAL, `Discard` fails the open if another process is attached; registry-bypassed opens reject `Discard`.
-* **`IO::sync_parent_dir`**, the fork's first **IO extension** (see [`docs/adr/0001-io-extensions-are-required-trait-methods.md`](docs/adr/0001-io-extensions-are-required-trait-methods.md)). It is a required method on the `IO` trait, so out-of-tree `IO` impls must now implement it; impls that cannot honour it return `LimboError::IoExtensionUnsupported`, and `Discard` then refuses to create a db.
+* **Orphan-WAL policy.** `DatabaseOpts::with_orphan_wal_policy` takes an `OrphanWalPolicy`. The default, `Replay`, keeps upstream behaviour. `Discard { empty, read_only }` makes a read-write open throw away a leftover `-wal` that sits beside a database file holding no database (absent or 0 bytes; optionally also 1 byte, or any file without a valid page-1 header), by truncating it to 0 bytes through the supplied `IO`, instead of letting it bring an old database back. Read-only opens never modify files: they either ignore the WAL or replay it as upstream does, and fail on an invalid header. In multiprocess WAL mode the open fails rather than discard while another process is attached. Under `Discard`, page 1 of a new database is fsynced, and its parent directory synced, before the first WAL frame is written. Under `Discard`, opens that bypass the in-process registry (`Database::do_open`/`do_open_async`) fail, so the sync engine, which reopens databases through that path, cannot be combined with `Discard`.
+* **`IO::sync_parent_dir`** is a new required method on the `IO` trait (an **IO extension**; see [docs/adr/0001-io-extensions-are-required-trait-methods.md](docs/adr/0001-io-extensions-are-required-trait-methods.md)). It makes a file's directory entry durable. Out-of-tree `IO` implementations must now implement it; an IO that cannot provide it returns `LimboError::IoExtensionUnsupported`, and `OrphanWalPolicy::Discard` then refuses to open an empty database on it.
 
 ## About
 
-Turso Database is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations — see the [FAQ](#faq) for where the project stands on its way to 1.0.
+Turso is an in-process SQL database written in Rust, compatible with SQLite. It runs in production today at multiple organizations.
+
+Turso is also a virtual machine. Like SQLite, it compiles SQL into bytecode for that machine, the VDBE, and then runs the bytecode. That design is what lets one engine host more than one SQL dialect. SQLite is the first and primary frontend that compiles to it, and Postgres is now a frontend of its own, with its own dialect and wire protocol. More will follow. Our goal is to be for databases what LLVM is to compilers, with one modern and reliable core, and many frontends compiled down onto it.
+
+How general is that core? General enough to [run Doom](https://github.com/tursodatabase/turso-vdbe-doom-example) on it.
+
+See the [FAQ](#faq) for where the project stands on its way to 1.0.
 
 ## Features and Roadmap
 
-* **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
+* **SQLite compatibility** for SQL dialect, file formats, and the C API, tracking SQLite version 3.50.4 [see [document](COMPAT.md) for details]
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for
@@ -64,6 +71,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 
 The database has the following experimental features:
 
+* **Postgres compatibility** for SQL dialect and wire protocol, see the see [compatibility reference](postgres/COMPAT.md) for details.
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 * **Full-Text-Search** powered by the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
@@ -442,6 +450,14 @@ That said, we have not yet reached 1.0. The project is under active development,
 ### How compatible is Turso Database with SQLite?
 
 Turso is compatible with SQLite at the SQL dialect, file format, and C API levels, and existing SQLite database files work as-is. We are not at 100% yet, so some differences are still expected — [COMPAT.md](COMPAT.md) tracks the details — but the gap is closing quickly, and full compatibility is a requirement for 1.0.
+
+### Is Turso a SQLite database or a Postgres database?
+
+It is one engine with more than one SQL frontend. SQLite is the original and primary frontend, with its dialect, its file format, and its C API, and if that is what you use, nothing changes for you. Postgres is a newer and still experimental frontend that speaks the Postgres dialect and wire protocol. They share everything below the SQL: the storage, the concurrency, the query compiler, and the VM. Postgres is additive.
+
+### What do you mean by "the LLVM of databases"?
+
+Like SQLite, Turso compiles a query into bytecode for a virtual machine called the VDBE, and runs that bytecode. SQL is just one language that compiles to it. Our goal is to make that VM a general target, with one modern and rigorously tested core, and many database frontends compiled onto it: SQLite, Postgres, and others over time. LLVM did this for compilers, where a stable intermediate representation let many languages share one backend, and we think databases deserve the same. The bytecode is general enough to [run Doom](https://github.com/tursodatabase/turso-vdbe-doom-example), if you want proof.
 
 ### How is Turso Database different from Turso's libSQL?
 

@@ -63,10 +63,7 @@ fn emit_multi_index_or_residual_filters(
 
     if requires_table_cursor {
         if let Some(index_cursor_id) = index_cursor_id {
-            program.emit_insn(Insn::DeferredSeek {
-                index_cursor_id,
-                table_cursor_id,
-            });
+            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
         }
     }
 
@@ -192,10 +189,14 @@ fn emit_seek_multi_index_branch(
         IterationDirection::Forwards => program.emit_insn(Insn::Next {
             cursor_id: branch_cursor_id,
             pc_if_next: branch_loop_start,
+            fullscan: false,
+            is_index: false,
         }),
         IterationDirection::Backwards => program.emit_insn(Insn::Prev {
             cursor_id: branch_cursor_id,
             pc_if_prev: branch_loop_start,
+            fullscan: false,
+            is_index: false,
         }),
     }
     program.preassign_label_to_next_insn(branch_loop_end);
@@ -282,6 +283,7 @@ fn emit_in_seek_multi_index_branch(
             target_pc: next_value_label,
             is_index: true,
             eq_only: false,
+            null_matching_mask: Default::default(),
         });
         program.preassign_label_to_next_insn(branch_loop_start);
         program.emit_insn(Insn::IdxGT {
@@ -321,6 +323,8 @@ fn emit_in_seek_multi_index_branch(
         program.emit_insn(Insn::Next {
             cursor_id: branch_cursor_id,
             pc_if_next: branch_loop_start,
+            fullscan: false,
+            is_index: false,
         });
     } else {
         program.emit_insn(Insn::SeekRowid {
@@ -361,6 +365,8 @@ fn emit_in_seek_multi_index_branch(
     program.emit_insn(Insn::Next {
         cursor_id: ephemeral_cursor_id,
         pc_if_next: outer_loop_start,
+        fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(branch_loop_end);
 

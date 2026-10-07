@@ -1,13 +1,12 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{
     async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
 };
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -28,7 +27,7 @@ struct BenchDb {
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
     // Enable MVCC via PRAGMA
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -320,7 +319,7 @@ impl HugeMultiWriteHarness {
         // In-memory IO: no fsync per commit, so the measurement reflects the
         // CPU-bound index-probe path the eq-only seek bound affects.
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         // Keep everything in MvStore so the measurement reflects the in-memory
@@ -356,7 +355,7 @@ impl HugeMultiWriteHarness {
 fn run_to_completion(db: &Arc<Database>, stmt: &mut Statement) {
     loop {
         match stmt.step().unwrap() {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step().unwrap();
             }
             // Drain the RETURNING rows.
@@ -427,14 +426,6 @@ fn bench_huge_multi_write_rowid(c: &mut Criterion) {
     run_huge_multi_write(c, "mvcc-huge-multi-write-rowid", GhostPlacement::RowidProbe);
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench, bench_huge_multi_write, bench_huge_multi_write_rowid
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();

@@ -4,16 +4,17 @@ use crate::SqlGen;
 use crate::ast::{
     BinOp, CompoundOperator, CompoundSelectArm, CteDefinition, CteMaterialization, Expr,
     FromClause, GroupByClause, JoinClause, JoinConstraint, JoinType, Literal, NullsOrder,
-    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WithClause,
+    OrderByItem, OrderDirection, SelectColumn, SelectStmt, WindowFrame, WindowFrameBoundary,
+    WindowFrameExclude, WindowFrameMode, WithClause,
 };
 use crate::capabilities::Capabilities;
-use crate::context::Context;
+use crate::context::{Context, ScopedTable};
 use crate::error::GenError;
-use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
+use crate::functions::aggregate_result_depends_on_input_order;
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
-use crate::policy::SelectConfig;
+use crate::policy::{SelectConfig, WindowFramePolicy};
 use crate::schema::{ColumnDef, DataType, Table};
 use crate::trace::Origin;
 use sql_gen_macros::trace_gen;
@@ -70,8 +71,7 @@ pub fn generate_tableless_select<C: Capabilities>(
     })
 }
 
-/// Controls whether `generate_select_impl` produces a full SELECT or a
-/// single-column scalar subquery.
+/// Controls the SELECT shape required by its caller.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SelectMode {
     /// Normal SELECT — arbitrary columns, clauses governed by `SelectConfig`.
@@ -79,16 +79,86 @@ enum SelectMode {
     /// Scalar subquery — exactly 1 output column, LIMIT 1, no alias/offset.
     /// Probabilities come from the `subquery_*` fields in `SelectConfig`.
     Scalar,
+    /// EXISTS subquery — one table, no clauses that prevent a semi-join.
+    Exists,
+    /// IN subquery — one column and no clauses that prevent a semi-join.
+    In,
+}
+
+/// Generate correlation keys accepted by the subquery unnesting optimizer.
+///
+/// Unnesting currently accepts only `=` between an inner column and an outer
+/// column. Generate one or two such keys, with either operand order. Other
+/// correlation operators cannot exercise rewritten-versus-correlated plans
+/// until the optimizer knows how to rewrite them.
+fn generate_supported_correlation_predicate(ctx: &mut Context) -> Option<Expr> {
+    let outer_tables = ctx.outer_tables()?.to_vec();
+    let inner_tables = ctx.tables_in_scope().to_vec();
+    let mut pairs = Vec::new();
+    for inner in &inner_tables {
+        for inner_column in inner.table.filterable_columns() {
+            for outer in &outer_tables {
+                for outer_column in outer.table.filterable_columns() {
+                    if inner_column.data_type == outer_column.data_type {
+                        pairs.push((
+                            inner.qualifier.clone(),
+                            inner_column.name.clone(),
+                            outer.qualifier.clone(),
+                            outer_column.name.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let pairs = ctx.subsequence(&pairs, 1..=2);
+    let mut predicates = Vec::with_capacity(pairs.len());
+    for (inner_table, inner_column, outer_table, outer_column) in pairs {
+        let inner = Expr::column_ref(ctx, Some(inner_table), inner_column);
+        let outer = Expr::column_ref(ctx, Some(outer_table), outer_column);
+        let (left, right) = if ctx.gen_bool() {
+            (inner, outer)
+        } else {
+            (outer, inner)
+        };
+        predicates.push(Expr::binary_op(ctx, left, BinOp::Eq, right));
+    }
+    let mut predicates = predicates.into_iter();
+    let first = predicates.next()?;
+    ctx.record_correlated_subquery();
+    Some(predicates.fold(first, |left, right| {
+        Expr::binary_op(ctx, left, BinOp::And, right)
+    }))
 }
 
 /// Generate a simple single-column SELECT (for scalar subqueries).
 ///
-/// Always returns exactly 1 column with LIMIT 1.
+/// Always returns exactly one column. Non-aggregate forms use `LIMIT 1`;
+/// ungrouped aggregate forms already return one row.
+#[trace_gen(Origin::Subquery)]
 pub fn generate_simple_select<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<SelectStmt, GenError> {
     generate_select_impl(generator, ctx, SelectMode::Scalar)
+}
+
+/// Generate the SELECT inside an EXISTS expression.
+#[trace_gen(Origin::Subquery)]
+pub fn generate_exists_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<SelectStmt, GenError> {
+    generate_select_impl(generator, ctx, SelectMode::Exists)
+}
+
+/// Generate the single-column SELECT inside an IN expression.
+#[trace_gen(Origin::Subquery)]
+pub fn generate_in_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<SelectStmt, GenError> {
+    generate_select_impl(generator, ctx, SelectMode::In)
 }
 
 /// Shared implementation for both full and scalar SELECT generation.
@@ -127,7 +197,23 @@ fn generate_select_impl<C: Capabilities>(
     };
 
     // --- Alias for primary table ---
-    let from_alias = if mode == SelectMode::Full
+    let from_alias = if mode != SelectMode::Full
+        && !ctx.tables_in_scope().is_empty()
+        && select_config.subquery_correlation_probability > 0.0
+    {
+        let enclosing_qualifiers: Vec<String> = ctx
+            .tables_in_scope()
+            .iter()
+            .map(|table| table.qualifier.clone())
+            .collect();
+        let alias = loop {
+            let candidate = ctx.next_table_alias();
+            if !enclosing_qualifiers.contains(&candidate) {
+                break candidate;
+            }
+        };
+        Some(alias)
+    } else if mode == SelectMode::Full
         && ident_config.generate_table_aliases
         && ctx.gen_bool_with_prob(select_config.table_alias_probability)
     {
@@ -165,7 +251,7 @@ fn generate_select_impl_inner<C: Capabilities>(
 
     // --- JOINs ---
     let join_config = &select_config.join_config;
-    let joins = if mode == SelectMode::Full
+    let mut joins = if mode == SelectMode::Full
         && ctx.gen_bool_with_prob(join_config.join_probability)
         && !generator.schema().tables.is_empty()
     {
@@ -173,18 +259,25 @@ fn generate_select_impl_inner<C: Capabilities>(
     } else {
         vec![]
     };
+    if !joins.is_empty() && ctx.gen_bool_with_prob(join_config.parenthesized_group_probability) {
+        add_parenthesized_groups(ctx, &mut joins);
+    }
 
     let gb_prob = match mode {
         SelectMode::Full => select_config.group_by_probability,
         SelectMode::Scalar => select_config.subquery_group_by_probability,
+        SelectMode::Exists | SelectMode::In => 0.0,
     };
     let where_prob = match mode {
         SelectMode::Full => select_config.where_probability,
-        SelectMode::Scalar => select_config.subquery_where_probability,
+        SelectMode::Scalar | SelectMode::Exists | SelectMode::In => {
+            select_config.subquery_where_probability
+        }
     };
     let order_by_prob = match mode {
         SelectMode::Full => select_config.order_by_probability,
         SelectMode::Scalar => select_config.subquery_order_by_probability,
+        SelectMode::Exists | SelectMode::In => 0.0,
     };
 
     // --- GROUP BY ---
@@ -199,11 +292,14 @@ fn generate_select_impl_inner<C: Capabilities>(
                     having: None,
                 })
             }
-            _ => None,
+            SelectMode::Scalar | SelectMode::Exists | SelectMode::In => None,
         }
     } else {
         None
     };
+    let scalar_aggregate_without_group = mode == SelectMode::Scalar
+        && group_by.is_none()
+        && ctx.gen_bool_with_prob(select_config.subquery_aggregate_probability);
 
     // --- Columns ---
     let mut columns = match mode {
@@ -215,7 +311,7 @@ fn generate_select_impl_inner<C: Capabilities>(
             }
         }
         SelectMode::Scalar => {
-            if group_by.is_some() {
+            if group_by.is_some() || scalar_aggregate_without_group {
                 // Aggregate output column
                 vec![SelectColumn {
                     expr: generate_aggregate_call(generator, ctx)?,
@@ -228,6 +324,10 @@ fn generate_select_impl_inner<C: Capabilities>(
                 }]
             }
         }
+        SelectMode::Exists | SelectMode::In => vec![SelectColumn {
+            expr: pick_scoped_column_ref(ctx)?,
+            alias: None,
+        }],
     };
 
     // When there is no GROUP BY and `restrict_mixed_aggregates` is enabled,
@@ -247,20 +347,33 @@ fn generate_select_impl_inner<C: Capabilities>(
     }
 
     // --- WHERE ---
-    let where_clause = if ctx.gen_bool_with_prob(where_prob) {
+    let generated_where = if ctx.gen_bool_with_prob(where_prob) {
         Some(generate_condition(generator, ctx)?)
     } else {
         None
+    };
+    let correlated = (mode != SelectMode::Full
+        && ctx.gen_bool_with_prob(select_config.subquery_correlation_probability))
+    .then(|| generate_supported_correlation_predicate(ctx))
+    .flatten();
+    let where_clause = match (generated_where, correlated) {
+        (Some(generated), Some(correlated)) => {
+            Some(Expr::binary_op(ctx, generated, BinOp::And, correlated))
+        }
+        (Some(generated), None) => Some(generated),
+        (None, Some(correlated)) => Some(correlated),
+        (None, None) => None,
     };
 
     // --- DISTINCT ---
     let distinct = match mode {
         SelectMode::Full => ctx.gen_bool_with_prob(select_config.distinct_probability),
-        // Scalar: only when not grouped
-        SelectMode::Scalar => {
-            group_by.is_none()
-                && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability)
-        }
+        // Scalar subqueries carry LIMIT 1, and DISTINCT makes that pick
+        // undecidable: when duplicates collapse, which duplicate's ORDER BY
+        // key survives is the engine's choice, so SQLite and Turso can return
+        // different rows and both are allowed. No tiebreaker can help because
+        // a unique column cannot be added through the deduplication.
+        SelectMode::Scalar | SelectMode::Exists | SelectMode::In => false,
     };
 
     let from = {
@@ -287,20 +400,24 @@ fn generate_select_impl_inner<C: Capabilities>(
     // --- Compound SELECT decision ---
     // Only at top level (not inside subqueries) since Turso doesn't support
     // compound SELECTs in subquery positions yet.
+    let compound_column_types = compound_column_types(&columns, ctx);
     let is_compound = mode == SelectMode::Full
         && ctx.subquery_depth() == 0
         && joins.is_empty()
         && group_by.is_none()
+        && compound_column_types.as_ref().is_some_and(|column_types| {
+            generator.schema().tables.iter().any(|table| {
+                column_types
+                    .iter()
+                    .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+            })
+        })
         && ctx.gen_bool_with_prob(select_config.compound_probability);
 
     if is_compound {
-        let num_result_cols = if columns.is_empty() {
-            // SELECT * — count columns from primary table
-            ctx.tables_in_scope()[0].table.columns.len()
-        } else {
-            columns.len()
-        };
-        let compounds = generate_compound_arms(generator, ctx, num_result_cols)?;
+        let column_types = compound_column_types.as_ref().unwrap();
+        let num_result_cols = column_types.len();
+        let compounds = generate_compound_arms(generator, ctx, column_types)?;
 
         // ORDER BY for compounds uses positional indices (1..N)
         let mut order_by = if ctx.gen_bool_with_prob(select_config.compound_order_by_probability) {
@@ -335,7 +452,9 @@ fn generate_select_impl_inner<C: Capabilities>(
         })
     } else {
         // --- ORDER BY ---
-        let mut order_by = if ctx.gen_bool_with_prob(order_by_prob) {
+        let mut order_by = if scalar_aggregate_without_group {
+            vec![]
+        } else if ctx.gen_bool_with_prob(order_by_prob) {
             if let Some(gb) = &group_by {
                 generate_grouped_order_by(generator, ctx, &gb.exprs)?
             } else {
@@ -348,7 +467,9 @@ fn generate_select_impl_inner<C: Capabilities>(
         // --- LIMIT / OFFSET ---
         let (limit, offset) = match mode {
             SelectMode::Full => generate_limit_offset(generator, ctx),
+            SelectMode::Scalar if scalar_aggregate_without_group => (None, None),
             SelectMode::Scalar => (Some(1), None),
+            SelectMode::Exists | SelectMode::In => (None, None),
         };
 
         // Enforce deterministic LIMIT semantics when configured.
@@ -358,6 +479,47 @@ fn generate_select_impl_inner<C: Capabilities>(
             } else {
                 generate_order_by(generator, ctx)?
             };
+        }
+
+        // A scalar subquery's LIMIT 1 must pick the same row in both engines,
+        // and an ORDER BY key with duplicate values leaves the pick to scan
+        // order. Grouped: order by every GROUP BY expression — groups are
+        // distinct combinations of them, so that is a total order. Ungrouped:
+        // append the table's primary key as a final tiebreaker.
+        if mode == SelectMode::Scalar && !scalar_aggregate_without_group {
+            if let Some(gb) = &group_by {
+                let covered: Vec<String> = order_by.iter().map(|i| i.expr.to_string()).collect();
+                for expr in &gb.exprs {
+                    if !covered.contains(&expr.to_string()) {
+                        let direction =
+                            select_order_direction(ctx, &select_config.order_direction_weights);
+                        order_by.push(OrderByItem {
+                            expr: expr.clone(),
+                            direction,
+                            nulls: None,
+                        });
+                    }
+                }
+            } else {
+                let scoped = &ctx.tables_in_scope()[0];
+                let qualifier = scoped.qualifier.clone();
+                let pk = scoped
+                    .table
+                    .columns
+                    .iter()
+                    .find(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "rowid".to_string());
+                let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+                order_by.push(OrderByItem {
+                    expr: Expr::ColumnRef(crate::ast::ColumnRef {
+                        table: Some(qualifier),
+                        column: pk,
+                    }),
+                    direction,
+                    nulls: None,
+                });
+            }
         }
 
         Ok(SelectStmt {
@@ -428,21 +590,16 @@ fn generate_group_by_clause<C: Capabilities>(
 
 /// Generate an aggregate function call on a random column.
 ///
-/// Array aggregate functions (e.g. ARRAY_AGG) are excluded by default since
-/// they are Turso-only and not supported by SQLite. They are only included
-/// when array support is explicitly enabled.
+/// The function policy controls which aggregates are available. The default
+/// policy disables array aggregates because SQLite does not support them.
 fn generate_aggregate_call<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
-    // Filter out array aggregate functions — they are Turso-only
-    let allowed: Vec<_> = AGGREGATE_FUNCTIONS
-        .iter()
-        .filter(|f| f.category != FunctionCategory::Array)
-        .collect();
-    let func = ctx
-        .choose(&allowed)
-        .ok_or_else(|| GenError::schema_empty("aggregate_functions"))?;
+    let func = generator
+        .policy()
+        .function_config
+        .select_aggregate_function(ctx)?;
 
     // Pick a column from scoped tables, with qualifier when multi-table
     let multi = ctx.has_multiple_tables();
@@ -642,17 +799,32 @@ fn generate_select_columns<C: Capabilities>(
             let num_cols = ctx.gen_range_inclusive((*range.start()).max(1), *range.end());
             let mut columns = Vec::with_capacity(num_cols);
             let restrict = select_config.restrict_mixed_aggregates;
+            let window_prob = select_config.window_function_probability.clamp(0.0, 1.0);
 
             for i in 0..num_cols {
-                let expr = generate_expr(generator, ctx, 0)?;
-                // When restricting mixed aggregates and there is no GROUP BY,
-                // an expression that mixes aggregate calls with bare column
-                // refs (e.g. `COUNT(a) + b`) is invalid SQL.  Replace it with
-                // a plain column reference.
-                let expr = if restrict && expr.contains_aggregate() && expr.contains_column_ref() {
-                    pick_scoped_column_ref(ctx)?
+                // Window functions are only valid as a result-column expression
+                // (or in ORDER BY of the same SELECT). We don't recurse: the
+                // window function call itself is the projection.
+                let expr = if window_prob > 0.0 && ctx.gen_bool_with_prob(window_prob) {
+                    generate_window_function(
+                        ctx,
+                        select_config.window_frame_policy,
+                        generator
+                            .policy()
+                            .function_config
+                            .allow_order_dependent_aggregates,
+                    )?
                 } else {
-                    expr
+                    let e = generate_expr(generator, ctx, 0)?;
+                    // When restricting mixed aggregates and there is no GROUP BY,
+                    // an expression that mixes aggregate calls with bare column
+                    // refs (e.g. `COUNT(a) + b`) is invalid SQL. Replace it with
+                    // a plain column reference.
+                    if restrict && e.contains_aggregate() && e.contains_column_ref() {
+                        pick_scoped_column_ref(ctx)?
+                    } else {
+                        e
+                    }
                 };
                 columns.push(SelectColumn {
                     expr,
@@ -665,6 +837,275 @@ fn generate_select_columns<C: Capabilities>(
             }
             Ok(columns)
         }
+    }
+}
+
+/// The set of built-in window functions Turso supports. Mirrors
+/// SQLite's built-in list at `window.c:610-625`.
+const BUILTIN_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
+    ("row_number", WindowFnArity::ZeroArg),
+    ("rank", WindowFnArity::ZeroArg),
+    ("dense_rank", WindowFnArity::ZeroArg),
+    ("percent_rank", WindowFnArity::ZeroArg),
+    ("cume_dist", WindowFnArity::ZeroArg),
+    ("ntile", WindowFnArity::Ntile),
+    ("lag", WindowFnArity::LagLead),
+    ("lead", WindowFnArity::LagLead),
+    ("first_value", WindowFnArity::OneArg),
+    ("last_value", WindowFnArity::OneArg),
+    ("nth_value", WindowFnArity::NthValue),
+];
+
+const AGGREGATE_WINDOW_FUNCS: &[(&str, WindowFnArity)] = &[
+    ("sum", WindowFnArity::OneArg),
+    ("total", WindowFnArity::OneArg),
+    ("count", WindowFnArity::OneArg),
+    ("avg", WindowFnArity::OneArg),
+    ("min", WindowFnArity::OneArg),
+    ("max", WindowFnArity::OneArg),
+    ("group_concat", WindowFnArity::Concat),
+    ("string_agg", WindowFnArity::Concat),
+    ("json_group_array", WindowFnArity::OneArg),
+];
+
+#[derive(Clone, Copy)]
+enum WindowFnArity {
+    ZeroArg,
+    OneArg,
+    Ntile,
+    NthValue,
+    LagLead,
+    Concat,
+}
+
+/// Generate a `func(...) OVER (...)` projection within the configured
+/// window-frame feature set.
+fn generate_window_function(
+    ctx: &mut Context,
+    frame_policy: WindowFramePolicy,
+    allow_order_dependent_aggregates: bool,
+) -> Result<Expr, GenError> {
+    let with_explicit_frame =
+        !matches!(frame_policy, WindowFramePolicy::CoercedOnly) && ctx.gen_bool();
+    let functions: Vec<_> = if with_explicit_frame {
+        AGGREGATE_WINDOW_FUNCS
+            .iter()
+            .filter(|(name, _)| {
+                allow_order_dependent_aggregates || !aggregate_result_depends_on_input_order(name)
+            })
+            .copied()
+            .collect()
+    } else {
+        BUILTIN_WINDOW_FUNCS.to_vec()
+    };
+    let (name, arity) = *ctx
+        .choose(&functions)
+        .expect("window function sets are non-empty");
+    let frame = with_explicit_frame.then(|| generate_window_frame(ctx, frame_policy));
+
+    // Pick a typed column for value args (lag/lead/first_value/etc).
+    // We restrict to columns the current scope sees; window functions
+    // are projection-only so the scope is the SELECT's FROM clause.
+    let arg_col = pick_scoped_column_ref(ctx)?;
+
+    let args: Vec<Expr> = match arity {
+        WindowFnArity::ZeroArg => Vec::new(),
+        WindowFnArity::OneArg => vec![arg_col],
+        WindowFnArity::Ntile => {
+            // ntile(N) — N must be a positive integer literal.
+            let n = ctx.gen_range_inclusive(1, 6) as i64;
+            vec![Expr::literal(ctx, Literal::Integer(n))]
+        }
+        WindowFnArity::NthValue => {
+            // nth_value(expr, N) — N must be a positive integer.
+            let n = ctx.gen_range_inclusive(1, 4) as i64;
+            vec![arg_col, Expr::literal(ctx, Literal::Integer(n))]
+        }
+        WindowFnArity::LagLead => {
+            // lag/lead take 1-3 args: expr[, offset[, default]].
+            let nargs = ctx.gen_range_inclusive(1, 3);
+            let mut a = vec![arg_col];
+            if nargs >= 2 {
+                // Negative offsets are legal and look in the opposite
+                // direction; for lag they exercise the streaming-frame
+                // miss behavior (forward lookups past the one buffered
+                // row return the default).
+                let offset = ctx.gen_range_inclusive(0, 8) as i64 - 4;
+                a.push(Expr::literal(ctx, Literal::Integer(offset)));
+            }
+            if nargs >= 3 {
+                let default = ctx.gen_range_inclusive(0, 200) as i64 - 100;
+                a.push(Expr::literal(ctx, Literal::Integer(default)));
+            }
+            a
+        }
+        WindowFnArity::Concat => vec![arg_col, pick_scoped_column_ref(ctx)?],
+    };
+
+    // Build the OVER clause: 0-2 PARTITION BY exprs, 0-2 ORDER BY
+    // exprs with the same direction. Columns picked from the SELECT
+    // scope so they're always valid.
+    let n_part = ctx.gen_range_inclusive(0, 2);
+    let range_has_offset = frame.is_some_and(|frame| {
+        matches!(frame.mode, WindowFrameMode::Range)
+            && matches!(
+                (frame.start, frame.end),
+                (
+                    WindowFrameBoundary::Preceding(_) | WindowFrameBoundary::Following(_),
+                    _
+                ) | (
+                    _,
+                    WindowFrameBoundary::Preceding(_) | WindowFrameBoundary::Following(_)
+                )
+            )
+    });
+    let n_ord = if range_has_offset {
+        1
+    } else {
+        ctx.gen_range_inclusive(0, 2)
+    };
+    let partition_by: Vec<Expr> = (0..n_part)
+        .map(|_| pick_scoped_column_ref(ctx))
+        .collect::<Result<_, _>>()?;
+    let dir = if ctx.gen_bool() {
+        OrderDirection::Asc
+    } else {
+        OrderDirection::Desc
+    };
+    let order_by: Vec<(Expr, OrderDirection)> = (0..n_ord)
+        .map(|_| pick_scoped_column_ref(ctx).map(|e| (e, dir)))
+        .collect::<Result<_, _>>()?;
+
+    // Some functions return floats whose default formatting differs
+    // between SQLite and Turso (e.g. percent_rank = 1/3). Wrap them in
+    // `printf('%.4f', ...)` so the textual comparison agrees while
+    // still exercising the same semantics.
+    let win = Expr::window_function(ctx, name.to_string(), args, partition_by, order_by, frame);
+    if matches!(name, "percent_rank" | "cume_dist") {
+        let fmt_str = Expr::literal(ctx, Literal::Text("%.4f".to_string()));
+        Ok(Expr::function_call(
+            ctx,
+            "printf".to_string(),
+            vec![fmt_str, win],
+        ))
+    } else {
+        Ok(win)
+    }
+}
+
+/// Generate an explicit frame within the configured feature set.
+fn generate_window_frame(ctx: &mut Context, frame_policy: WindowFramePolicy) -> WindowFrame {
+    match frame_policy {
+        WindowFramePolicy::CoercedOnly => {
+            unreachable!("coerced-only policy does not generate explicit frames")
+        }
+        WindowFramePolicy::Rows => generate_offset_frame(ctx, WindowFrameMode::Rows),
+        WindowFramePolicy::GroupsAndOffsetFreeRange => match ctx.gen_range(3) {
+            0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+            1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+            2 => generate_offset_free_range_frame(ctx),
+            _ => unreachable!("range is limited to three frame modes"),
+        },
+        WindowFramePolicy::RangeOffsets => match ctx.gen_range(3) {
+            0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+            1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+            2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+            _ => unreachable!("range is limited to three frame modes"),
+        },
+        WindowFramePolicy::Exclude => {
+            let mut frame = match ctx.gen_range(3) {
+                0 => generate_offset_frame(ctx, WindowFrameMode::Rows),
+                1 => generate_offset_frame(ctx, WindowFrameMode::Groups),
+                2 => generate_offset_frame(ctx, WindowFrameMode::Range),
+                _ => unreachable!("range is limited to three frame modes"),
+            };
+            // Retain unexcluded frames so the latest policy continues to
+            // exercise xInverse in addition to the full-scan EXCLUDE path.
+            frame.exclude = if ctx.gen_bool() {
+                None
+            } else {
+                Some(match ctx.gen_range(4) {
+                    0 => WindowFrameExclude::NoOthers,
+                    1 => WindowFrameExclude::CurrentRow,
+                    2 => WindowFrameExclude::Group,
+                    3 => WindowFrameExclude::Ties,
+                    _ => unreachable!("range is limited to four exclusion variants"),
+                })
+            };
+            frame
+        }
+    }
+}
+
+/// Generate one of the structurally valid boundary combinations for a
+/// frame mode that supports integer offsets.
+/// The two offsets are deliberately independent so same-kind pairs also
+/// exercise frames that are empty for every row.
+fn generate_offset_frame(ctx: &mut Context, mode: WindowFrameMode) -> WindowFrame {
+    let start_offset = ctx.gen_range_inclusive(0, 4) as u64;
+    let end_offset = ctx.gen_range_inclusive(0, 4) as u64;
+    use WindowFrameBoundary as Boundary;
+    let (start, end) = match ctx.gen_range(13) {
+        0 => (
+            Boundary::UnboundedPreceding,
+            Boundary::Preceding(end_offset),
+        ),
+        1 => (Boundary::UnboundedPreceding, Boundary::CurrentRow),
+        2 => (
+            Boundary::UnboundedPreceding,
+            Boundary::Following(end_offset),
+        ),
+        3 => (Boundary::UnboundedPreceding, Boundary::UnboundedFollowing),
+        4 => (
+            Boundary::Preceding(start_offset),
+            Boundary::Preceding(end_offset),
+        ),
+        5 => (Boundary::Preceding(start_offset), Boundary::CurrentRow),
+        6 => (
+            Boundary::Preceding(start_offset),
+            Boundary::Following(end_offset),
+        ),
+        7 => (
+            Boundary::Preceding(start_offset),
+            Boundary::UnboundedFollowing,
+        ),
+        8 => (Boundary::CurrentRow, Boundary::CurrentRow),
+        9 => (Boundary::CurrentRow, Boundary::Following(end_offset)),
+        10 => (Boundary::CurrentRow, Boundary::UnboundedFollowing),
+        11 => (
+            Boundary::Following(start_offset),
+            Boundary::Following(end_offset),
+        ),
+        12 => (
+            Boundary::Following(start_offset),
+            Boundary::UnboundedFollowing,
+        ),
+        _ => unreachable!("range is limited to 13 offset frame shapes"),
+    };
+    WindowFrame {
+        mode,
+        start,
+        end,
+        exclude: None,
+    }
+}
+
+/// Generate one of the four structurally valid RANGE frames without a
+/// numeric PRECEDING/FOLLOWING offset.
+fn generate_offset_free_range_frame(ctx: &mut Context) -> WindowFrame {
+    use WindowFrameBoundary as Boundary;
+    let (start, end) = match ctx.gen_range(4) {
+        0 => (Boundary::UnboundedPreceding, Boundary::CurrentRow),
+        1 => (Boundary::UnboundedPreceding, Boundary::UnboundedFollowing),
+        2 => (Boundary::CurrentRow, Boundary::CurrentRow),
+        3 => (Boundary::CurrentRow, Boundary::UnboundedFollowing),
+        _ => unreachable!("range is limited to four offset-free RANGE shapes"),
+    };
+    WindowFrame {
+        mode: WindowFrameMode::Range,
+        start,
+        end,
+        exclude: None,
     }
 }
 
@@ -735,7 +1176,13 @@ fn generate_order_by<C: Capabilities>(
                 // Avoid bare literals — SQLite interprets integer literals in
                 // ORDER BY as column-ordinal positions (e.g. ORDER BY 2).
                 // Also catch unary wrappers like -478008 or +3.
-                if looks_like_literal(&e) {
+                //
+                // Also avoid any term without a column reference: it computes
+                // the same value for every row, so all keys tie and the order
+                // is whatever scan order the engine used. With a LIMIT that
+                // makes the surviving rows engine-specific, and both answers
+                // are allowed.
+                if looks_like_literal(&e) || !e.contains_column_ref() {
                     pick_scoped_column_ref(ctx)?
                 } else {
                     e
@@ -818,15 +1265,14 @@ fn select_nulls_order(
 }
 
 // ---------------------------------------------------------------------------
-// Stub generation functions for SELECT-related features (not yet implemented).
-// These appear as "not hit" in coverage reports, making gaps visible.
+// JOIN generation.
 // ---------------------------------------------------------------------------
 
 /// Generate JOIN clauses for a SELECT statement.
 ///
 /// Picks a random number of joins (1..=max_joins), selects join types by weight,
-/// and generates ON conditions for INNER/LEFT joins. Each joined table is pushed
-/// into the current scope before generating its ON condition.
+/// and generates NATURAL, USING, or ON constraints. Each joined table is pushed
+/// into the current scope before generating its constraint.
 pub(crate) fn generate_join_clauses<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -851,23 +1297,30 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
     let mut joins = Vec::with_capacity(num_joins);
 
     let type_weights = &join_config.join_type_weights;
+    let join_types: Vec<JoinType> = (0..num_joins)
+        .map(|_| {
+            let weights = [
+                type_weights.inner,
+                type_weights.left,
+                type_weights.right,
+                type_weights.full,
+                type_weights.cross,
+            ];
+            match ctx.weighted_index(&weights) {
+                Some(0) => JoinType::Inner,
+                Some(1) => JoinType::Left,
+                Some(2) => JoinType::Right,
+                Some(3) => JoinType::Full,
+                Some(4) => JoinType::Cross,
+                _ => JoinType::Inner,
+            }
+        })
+        .collect();
+    let from_has_right_or_full = join_types
+        .iter()
+        .any(|join_type| matches!(join_type, JoinType::Right | JoinType::Full));
 
-    for _ in 0..num_joins {
-        // Pick join type
-        let weights = [
-            type_weights.inner,
-            type_weights.left,
-            type_weights.cross,
-            type_weights.natural,
-        ];
-        let join_type = match ctx.weighted_index(&weights) {
-            Some(0) => JoinType::Inner,
-            Some(1) => JoinType::Left,
-            Some(2) => JoinType::Cross,
-            Some(3) => JoinType::Natural,
-            _ => JoinType::Inner,
-        };
-
+    for join_type in join_types {
         // Pick table (with self-join probability)
         let is_self_join = ctx.gen_bool_with_prob(join_config.self_join_probability);
         let joined_table = if is_self_join {
@@ -876,9 +1329,11 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
             ctx.choose(schema_tables).unwrap().clone()
         };
 
-        // Determine alias. Self-joins require aliases to avoid ambiguity.
-        let needs_alias = is_self_join
-            || joined_table.name == primary_table.name
+        let table_name_is_already_in_scope = ctx
+            .tables_in_scope()
+            .iter()
+            .any(|table| table.table.name == joined_table.name);
+        let needs_alias = table_name_is_already_in_scope
             || ctx.gen_bool_with_prob(generator.policy().select_config.table_alias_probability);
         let alias = if needs_alias {
             Some(ctx.next_table_alias())
@@ -889,130 +1344,250 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
         // Push joined table into scope so ON condition and subsequent clauses see it
         ctx.push_table(joined_table.clone(), alias.clone());
 
-        // Generate ON constraint for INNER/LEFT joins
-        let constraint = match join_type {
-            JoinType::Inner | JoinType::Left => {
-                let on_expr = generate_join_on_condition(generator, ctx)?;
-                Some(JoinConstraint::On(on_expr))
-            }
-            JoinType::Natural => {
-                // NATURAL JOIN: only valid if tables share column names.
-                // If they don't, fall back to INNER JOIN with ON condition.
-                let shared = primary_table
-                    .columns
-                    .iter()
-                    .any(|c| joined_table.columns.iter().any(|jc| jc.name == c.name));
-                if shared {
-                    None
-                } else {
-                    // Fall back to INNER with ON
-                    let on_expr = generate_join_on_condition(generator, ctx)?;
-                    joins.push(JoinClause {
-                        join_type: JoinType::Inner,
-                        table: joined_table.qualified_name(),
-                        alias,
-                        constraint: Some(JoinConstraint::On(on_expr)),
-                    });
-                    continue;
-                }
-            }
-            JoinType::Cross => None,
-        };
-
-        // Record the join origin for coverage
+        let natural = join_type != JoinType::Cross
+            && ctx.gen_bool_with_prob(join_config.natural_join_probability)
+            && (!from_has_right_or_full || !natural_join_has_ambiguous_column(ctx, &joins));
         let origin = match join_type {
             JoinType::Inner => Origin::Join,
             JoinType::Left => Origin::LeftJoin,
+            JoinType::Right => Origin::RightJoin,
+            JoinType::Full => Origin::FullJoin,
             JoinType::Cross => Origin::CrossJoin,
-            JoinType::Natural => Origin::NaturalJoin,
         };
-        ctx.scope(origin, |_| {});
+        let constraint = ctx.scope(origin, |ctx| -> Result<_, GenError> {
+            if natural {
+                ctx.scope(Origin::NaturalJoin, |_| {});
+                return Ok(None);
+            }
+            if join_type == JoinType::Cross
+                || !ctx.gen_bool_with_prob(join_config.join_constraint_probability)
+            {
+                return Ok(None);
+            }
+            if ctx.gen_bool_with_prob(join_config.using_probability) {
+                let columns = generate_join_using_columns(ctx, &joins, from_has_right_or_full);
+                if !columns.is_empty() {
+                    return Ok(Some(JoinConstraint::Using(columns)));
+                }
+            }
+            Ok(Some(JoinConstraint::On(generate_join_on_condition(
+                generator, ctx,
+            )?)))
+        })?;
 
         joins.push(JoinClause {
             join_type,
+            natural,
             table: joined_table.qualified_name(),
             alias,
             constraint,
+            closed_groups: vec![],
         });
     }
 
     Ok(joins)
 }
 
+/// Wrap the FROM table and the joins after it in one or more parenthesized
+/// groups. Every group starts at the FROM table, so an ON condition inside a
+/// group only uses tables that are also inside it.
+fn add_parenthesized_groups(ctx: &mut Context, joins: &mut [JoinClause]) {
+    let group_count = ctx.gen_range_inclusive(1, joins.len());
+    for _ in 0..group_count {
+        let last_join = ctx.gen_range(joins.len());
+        let alias = ctx.gen_bool_with_prob(0.5).then(|| ctx.next_table_alias());
+        joins[last_join].closed_groups.push(alias);
+    }
+    ctx.scope(Origin::ParenthesizedJoin, |_| {});
+}
+
+/// Return true if a right table column name occurs in more than one left table
+/// and an earlier join did not merge it. When the FROM list has a RIGHT or FULL
+/// join, SQLite rejects a NATURAL join in this case because its generated USING
+/// name is ambiguous.
+///
+/// This is deliberately cautious: it checks every right column, not only the
+/// names the NATURAL join would actually use, so it skips some valid NATURAL
+/// joins. That only loses coverage.
+fn natural_join_has_ambiguous_column(ctx: &Context, left_joins: &[JoinClause]) -> bool {
+    let (_, right_table) = join_inputs(ctx);
+    right_table
+        .columns
+        .iter()
+        .any(|right_column| !repeated_left_column_is_merged(ctx, left_joins, &right_column.name))
+}
+
+/// Select column names for a USING clause.
+///
+/// Each name occurs in both inputs. When the FROM list has a RIGHT or FULL join,
+/// prior USING or NATURAL joins must merge repeated left names. SQLite otherwise
+/// reports ambiguity.
+fn generate_join_using_columns(
+    ctx: &mut Context,
+    left_joins: &[JoinClause],
+    from_has_right_or_full: bool,
+) -> Vec<String> {
+    let (left_tables, right_table) = join_inputs(ctx);
+    // A generated CTE can expose a name more than once. USING accepts each name once.
+    let mut used_names = std::collections::HashSet::new();
+    let valid_names: Vec<String> = right_table
+        .columns
+        .iter()
+        .filter(|right_column| {
+            used_names.insert(right_column.name.clone())
+                && left_tables
+                    .iter()
+                    .any(|table| has_column(&table.table, &right_column.name))
+                && (!from_has_right_or_full
+                    || repeated_left_column_is_merged(ctx, left_joins, &right_column.name))
+        })
+        .map(|column| column.name.clone())
+        .collect();
+
+    let max_columns = valid_names.len().min(3);
+    ctx.subsequence(&valid_names, 1..=max_columns)
+}
+
+/// Return true if every left table after the first one that has this column
+/// joined with NATURAL or with USING on this name. SQLite requires this when the
+/// FROM list has a RIGHT or FULL join.
+///
+/// The engine enforces the same rule in `left_using_column_sources`, after
+/// SQLite's `sqlite3ProcessJoin` (select.c). The generator keeps its own copy
+/// so it can predict which statements are valid; the fuzzer catches drift.
+fn repeated_left_column_is_merged(ctx: &Context, left_joins: &[JoinClause], name: &str) -> bool {
+    let (left_tables, _) = join_inputs(ctx);
+    assert_eq!(left_joins.len() + 1, left_tables.len());
+    left_tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| has_column(&table.table, name))
+        .skip(1)
+        .all(|(table_index, _)| {
+            let join = &left_joins[table_index - 1];
+            join.natural
+                || matches!(&join.constraint, Some(JoinConstraint::Using(columns)) if columns.iter().any(|column| column == name))
+        })
+}
+
+/// Return the left tables and the right table of the newest join in scope.
+fn join_inputs(ctx: &Context) -> (&[ScopedTable], &Table) {
+    let (right, left) = ctx
+        .tables_in_scope()
+        .split_last()
+        .expect("a join needs a right table");
+    assert!(!left.is_empty(), "a join needs two tables");
+    (left, &right.table)
+}
+
+fn has_column(table: &Table, name: &str) -> bool {
+    table.columns.iter().any(|column| column.name == name)
+}
+
 /// Generate the ON condition for a JOIN.
 ///
-/// With `equi_join_probability`, generates `left_qualifier.col = right_qualifier.col`
-/// using compatible columns. Otherwise generates a general boolean expression.
-/// Both tables are read from the current scope: the primary table is `[0]` and the
-/// just-pushed joined table is the last entry.
+/// With `equi_join_probability`, this generates `left.col = right.col`.
+/// Otherwise, it compares those columns with a non-equality operator. For a join
+/// chain, the left column can come from any table in the current left input.
 pub(crate) fn generate_join_on_condition<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
     let join_config = &generator.policy().select_config.join_config;
 
-    // Read tables from scope
-    let left_qualifier = ctx.tables_in_scope()[0].qualifier.clone();
-    let left_table = ctx.tables_in_scope()[0].table.clone();
-    let right_scope = ctx.tables_in_scope().last().unwrap();
-    let right_qualifier = right_scope.qualifier.clone();
-    let right_table = right_scope.table.clone();
-
-    if ctx.gen_bool_with_prob(join_config.equi_join_probability) {
-        // Try to find compatible columns (same data type) between the two tables
-        let left_cols: Vec<_> = left_table
-            .filterable_columns()
-            .map(|c| (c.name.clone(), c.data_type))
-            .collect();
-        let right_cols: Vec<_> = right_table
-            .filterable_columns()
-            .map(|c| (c.name.clone(), c.data_type))
-            .collect();
-
-        if !left_cols.is_empty() && !right_cols.is_empty() {
-            let (left_name, left_dt) = ctx.choose(&left_cols).unwrap().clone();
-            // Try to find a right column with matching type
-            let compatible: Vec<_> = right_cols.iter().filter(|(_, dt)| *dt == left_dt).collect();
-            let right_name = if compatible.is_empty() {
-                ctx.choose(&right_cols).unwrap().0.clone()
-            } else {
-                ctx.choose(&compatible).unwrap().0.clone()
-            };
-
-            let left_expr = Expr::column_ref(ctx, Some(left_qualifier), left_name);
-            let right_expr = Expr::column_ref(ctx, Some(right_qualifier), right_name);
-
-            return Ok(Expr::binary_op(ctx, left_expr, BinOp::Eq, right_expr));
-        }
-    }
-
-    // Fall back to a general condition using a column from the right table
-    let right_col_names: Vec<(String, DataType)> = right_table
+    let table_count = ctx.tables_in_scope().len();
+    assert!(table_count >= 2, "a join condition needs two tables");
+    let right_scope = ctx.tables_in_scope()[table_count - 1].clone();
+    let left_index = ctx.gen_range(table_count - 1);
+    let left_scope = ctx.tables_in_scope()[left_index].clone();
+    let left_columns: Vec<(String, DataType)> = left_scope
+        .table
         .filterable_columns()
-        .map(|c| (c.name.clone(), c.data_type))
+        .map(|column| (column.name.clone(), column.data_type))
         .collect();
-    if right_col_names.is_empty() {
-        // If no filterable columns, generate a literal condition
+    let right_columns: Vec<(String, DataType)> = right_scope
+        .table
+        .filterable_columns()
+        .map(|column| (column.name.clone(), column.data_type))
+        .collect();
+
+    if left_columns.is_empty() || right_columns.is_empty() {
         let lit = generate_literal(ctx, DataType::Integer, generator.policy());
         return Ok(Expr::literal(ctx, lit));
     }
-    let (col_name, col_dt) = ctx.choose(&right_col_names).unwrap().clone();
-    let col_expr = Expr::column_ref(ctx, Some(right_qualifier), col_name);
-    let lit = generate_literal(ctx, col_dt, generator.policy());
-    let lit_expr = Expr::literal(ctx, lit);
-    let ops = BinOp::comparison();
-    let op = *ctx.choose(ops).unwrap();
-    Ok(Expr::binary_op(ctx, col_expr, op, lit_expr))
+
+    let (left_name, left_type) = ctx.choose(&left_columns).unwrap().clone();
+    let same_type_right_columns: Vec<_> = right_columns
+        .iter()
+        .filter(|(_, data_type)| *data_type == left_type)
+        .collect();
+    let right_name = if same_type_right_columns.is_empty() {
+        ctx.choose(&right_columns).unwrap().0.clone()
+    } else {
+        ctx.choose(&same_type_right_columns).unwrap().0.clone()
+    };
+    let op = if ctx.gen_bool_with_prob(join_config.equi_join_probability) {
+        BinOp::Eq
+    } else {
+        let non_equality_ops = [BinOp::Ne, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge];
+        *ctx.choose(&non_equality_ops).unwrap()
+    };
+    let left_expr = Expr::column_ref(ctx, Some(left_scope.qualifier), left_name);
+    let right_expr = Expr::column_ref(ctx, Some(right_scope.qualifier), right_name);
+    Ok(Expr::binary_op(ctx, left_expr, op, right_expr))
+}
+
+/// Return the declared type of each result column when every result is a table
+/// column. Expressions have no dependable declared type for compound queries.
+fn compound_column_types(columns: &[SelectColumn], ctx: &Context) -> Option<Vec<DataType>> {
+    if columns.is_empty() {
+        return Some(
+            ctx.tables_in_scope()[0]
+                .table
+                .columns
+                .iter()
+                .map(|column| column.data_type)
+                .collect(),
+        );
+    }
+
+    columns
+        .iter()
+        .map(|column| {
+            let Expr::ColumnRef(column_ref) = &column.expr else {
+                return None;
+            };
+            ctx.tables_in_scope()
+                .iter()
+                .filter(|table| {
+                    column_ref.table.as_ref().is_none_or(|qualifier| {
+                        qualifier == &table.qualifier || qualifier == &table.table.name
+                    })
+                })
+                .find_map(|table| {
+                    table
+                        .table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == column_ref.column)
+                        .map(|column| column.data_type)
+                })
+        })
+        .collect()
 }
 
 /// Generate compound arms for a compound SELECT.
 ///
-/// Each arm picks a table, generates columns matching `num_cols`, and optionally
-/// generates a WHERE clause. The compound operator is chosen by weighted random.
+/// Each arm picks a table, generates columns matching `column_types`, and
+/// optionally generates a WHERE clause. SQLite is free to choose the declared
+/// type of a compound result column from any SELECT arm. If the arms use
+/// different types, SQLite may turn an integer into a real while Turso leaves it
+/// unchanged, and both results are allowed. Using the same type in every arm
+/// gives the fuzzer one result to compare.
 fn generate_compound_arms<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    num_cols: usize,
+    column_types: &[DataType],
 ) -> Result<Vec<CompoundSelectArm>, GenError> {
     let select_config = &generator.policy().select_config;
     let weights = &select_config.compound_operator_weights;
@@ -1046,18 +1621,43 @@ fn generate_compound_arms<C: Capabilities>(
 
         let arm = ctx.scope(origin, |ctx| {
             // Pick a table for this arm
+            let tables: Vec<_> = generator
+                .schema()
+                .tables
+                .iter()
+                .filter(|table| {
+                    column_types
+                        .iter()
+                        .all(|data_type| table.columns_of_type(*data_type).next().is_some())
+                })
+                .cloned()
+                .collect();
             let table = ctx
-                .choose(&generator.schema().tables)
-                .ok_or_else(|| GenError::schema_empty("tables"))?;
-            let table = table.clone();
+                .choose(&tables)
+                .ok_or_else(|| {
+                    GenError::exhausted("compound_select", "no table has matching columns")
+                })?
+                .clone();
             let table_name = table.qualified_name();
 
             // Generate columns in a temporary table scope for this arm's table
             let (columns, where_clause) = ctx.with_table_scope(vec![(table, None)], |ctx| {
-                // Generate columns matching the required count
-                let mut cols = Vec::with_capacity(num_cols);
-                for _ in 0..num_cols {
-                    let expr = pick_scoped_column_ref(ctx)?;
+                let matching_columns: Vec<Vec<String>> = {
+                    let table = &ctx.tables_in_scope()[0].table;
+                    column_types
+                        .iter()
+                        .map(|data_type| {
+                            table
+                                .columns_of_type(*data_type)
+                                .map(|column| column.name.clone())
+                                .collect()
+                        })
+                        .collect()
+                };
+                let mut cols = Vec::with_capacity(column_types.len());
+                for column_names in matching_columns {
+                    let column_name = ctx.choose(&column_names).unwrap().clone();
+                    let expr = Expr::column_ref(ctx, None, column_name);
                     cols.push(SelectColumn { expr, alias: None });
                 }
 
@@ -1407,7 +2007,7 @@ fn generate_aggregate_filter<C: Capabilities>(
 mod tests {
     use super::*;
     use crate::Full;
-    use crate::policy::Policy;
+    use crate::policy::{FunctionConfig, Policy};
     use crate::schema::{ColumnDef, DataType, SchemaBuilder, Table};
 
     fn test_generator() -> SqlGen<Full> {
@@ -1426,6 +2026,58 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_generation_can_exclude_results_that_depend_on_input_order() {
+        let policy = Policy::default()
+            .with_function_config(FunctionConfig::default().without_order_dependent_aggregates());
+        let generator: SqlGen<Full> = SqlGen::new(test_generator().schema().clone(), policy);
+        let table = generator.schema().tables[0].clone();
+
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope([(table.clone(), None)], |ctx| -> Result<(), GenError> {
+                let Expr::FunctionCall(call) = generate_aggregate_call(&generator, ctx)? else {
+                    unreachable!("aggregate generation must return a function call");
+                };
+                assert!(
+                    !aggregate_result_depends_on_input_order(&call.name),
+                    "seed {seed} generated {}",
+                    call.name
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn window_generation_can_exclude_results_that_depend_on_input_order() {
+        let generator = test_generator();
+        let table = generator.schema().tables[0].clone();
+        let mut generated_aggregate = false;
+
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope([(table.clone(), None)], |ctx| -> Result<(), GenError> {
+                let expr = generate_window_function(ctx, WindowFramePolicy::Rows, false)?;
+                if let Expr::WindowFunction(window) = expr
+                    && window.frame.is_some()
+                {
+                    generated_aggregate = true;
+                    assert!(
+                        !aggregate_result_depends_on_input_order(&window.name),
+                        "seed {seed} generated {}",
+                        window.name
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert!(generated_aggregate);
+    }
+
+    #[test]
     fn test_generate_select() {
         let generator = test_generator();
         let mut ctx = Context::new_with_seed(42);
@@ -1436,6 +2088,374 @@ mod tests {
         let sql = stmt.unwrap().to_string();
         assert!(sql.starts_with("SELECT"));
         assert!(sql.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_rows_window_frame_policy_generates_aggregate_frames() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Rows,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut generated_rows_frame = false;
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            if sql.contains(" ROWS BETWEEN ") {
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+                generated_rows_frame = true;
+                break;
+            }
+        }
+        assert!(
+            generated_rows_frame,
+            "ROWS policy should generate an explicit frame"
+        );
+    }
+
+    #[test]
+    fn test_groups_and_range_window_frame_policy_generates_supported_modes() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::GroupsAndOffsetFreeRange,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_rows = false;
+        let mut saw_groups = false;
+        let mut saw_range = false;
+
+        for seed in 0..500 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            let has_explicit_frame = [
+                (" ROWS BETWEEN ", &mut saw_rows),
+                (" GROUPS BETWEEN ", &mut saw_groups),
+                (" RANGE BETWEEN ", &mut saw_range),
+            ]
+            .into_iter()
+            .fold(false, |found, (needle, seen)| {
+                if sql.contains(needle) {
+                    *seen = true;
+                    true
+                } else {
+                    found
+                }
+            });
+            if has_explicit_frame {
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+            }
+            if saw_rows && saw_groups && saw_range {
+                break;
+            }
+        }
+
+        assert!(saw_rows, "phase-2 policy should retain ROWS generation");
+        assert!(saw_groups, "phase-2 policy should generate GROUPS frames");
+        assert!(
+            saw_range,
+            "phase-2 policy should generate offset-free RANGE frames"
+        );
+    }
+
+    #[test]
+    fn test_range_offset_policy_generates_ordered_numeric_range_frames() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::RangeOffsets,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..500 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                assert!(
+                    [
+                        "sum(",
+                        "total(",
+                        "count(",
+                        "avg(",
+                        "min(",
+                        "max(",
+                        "group_concat(",
+                        "string_agg(",
+                        "json_group_array(",
+                    ]
+                    .iter()
+                    .any(|name| sql.contains(name)),
+                    "explicit frames must be attached to supported sliding aggregates: {sql}"
+                );
+                return;
+            }
+        }
+        panic!("RANGE-offset policy should generate a numeric RANGE boundary");
+    }
+
+    #[test]
+    fn test_exclude_policy_generates_all_variants() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 1,
+            expression_count_range: 1..=1,
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            window_function_probability: 1.0,
+            window_frame_policy: WindowFramePolicy::Exclude,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_no_others = false;
+        let mut saw_current_row = false;
+        let mut saw_group = false;
+        let mut saw_ties = false;
+        let mut saw_offset_range = false;
+        let mut saw_unexcluded_removable_prefix = false;
+
+        for seed in 0..2000 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let sql = select.to_string();
+
+            saw_no_others |= sql.contains(" EXCLUDE NO OTHERS");
+            saw_current_row |= sql.contains(" EXCLUDE CURRENT ROW");
+            saw_group |= sql.contains(" EXCLUDE GROUP");
+            saw_ties |= sql.contains(" EXCLUDE TIES");
+
+            let is_offset_range = sql.contains(" RANGE BETWEEN ")
+                && (sql.contains(" PRECEDING") || sql.contains(" FOLLOWING"));
+            if is_offset_range && sql.contains(" EXCLUDE ") {
+                assert!(
+                    sql.contains("ORDER BY "),
+                    "RANGE offsets require exactly one ORDER BY expression: {sql}"
+                );
+                saw_offset_range = true;
+            }
+            saw_unexcluded_removable_prefix |= sql.contains(" BETWEEN ")
+                && !sql.contains("BETWEEN UNBOUNDED PRECEDING")
+                && !sql.contains(" EXCLUDE ")
+                && [
+                    "min(",
+                    "max(",
+                    "group_concat(",
+                    "string_agg(",
+                    "json_group_array(",
+                ]
+                .iter()
+                .any(|name| sql.contains(name));
+
+            if saw_no_others
+                && saw_current_row
+                && saw_group
+                && saw_ties
+                && saw_offset_range
+                && saw_unexcluded_removable_prefix
+            {
+                return;
+            }
+        }
+
+        panic!(
+            "EXCLUDE policy coverage incomplete: no_others={saw_no_others}, \
+             current_row={saw_current_row}, group={saw_group}, ties={saw_ties}, \
+             offset_range={saw_offset_range}, \
+             unexcluded_removable_prefix={saw_unexcluded_removable_prefix}"
+        );
+    }
+
+    #[test]
+    fn scalar_subqueries_pick_a_deterministic_row() {
+        // LIMIT 1 must select the same row in both engines, so a scalar
+        // subquery may not use DISTINCT, and its ORDER BY must fully decide
+        // the winner: the primary key as a tiebreaker, or (when grouped)
+        // every GROUP BY expression.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let stmt = generate_simple_select(&generator, ctx)?;
+                    assert!(!stmt.distinct, "seed {seed}: scalar subquery uses DISTINCT");
+                    if let Some(gb) = &stmt.group_by {
+                        let ordered: Vec<String> =
+                            stmt.order_by.iter().map(|i| i.expr.to_string()).collect();
+                        for e in &gb.exprs {
+                            assert!(
+                                ordered.contains(&e.to_string()),
+                                "seed {seed}: GROUP BY expr {e} missing from ORDER BY"
+                            );
+                        }
+                    } else {
+                        let last = stmt.order_by.last().expect("scalar must have ORDER BY");
+                        assert!(
+                            matches!(&last.expr, Expr::ColumnRef(c) if c.column == "id"
+                                || c.column == "rowid"),
+                            "seed {seed}: last ORDER BY term is not the tiebreaker: {}",
+                            last.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn order_by_terms_always_reference_a_column() {
+        // A term that computes the same value for every row (e.g.
+        // REPLACE('a','b','c')) makes every key tie, so with a LIMIT the
+        // surviving rows depend on engine scan order.
+        let generator = test_generator();
+        for seed in 0..300 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope(
+                [(generator.schema().tables[0].clone(), None)],
+                |ctx| -> Result<(), GenError> {
+                    let items = generate_order_by(&generator, ctx)?;
+                    for item in items {
+                        assert!(
+                            item.expr.contains_column_ref(),
+                            "seed {seed} produced constant ORDER BY term: {}",
+                            item.expr
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_compound_arms_use_matching_column_types() {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "mixed",
+                vec![
+                    ColumnDef::new("integer_value", DataType::Integer),
+                    ColumnDef::new("real_value", DataType::Real),
+                ],
+            ))
+            .table(Table::new(
+                "integers",
+                vec![ColumnDef::new("integer_value", DataType::Integer)],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, Policy::default());
+        let mut ctx = Context::new_with_seed(42);
+
+        let arms =
+            generate_compound_arms(&generator, &mut ctx, &[DataType::Integer, DataType::Real])
+                .unwrap();
+
+        for arm in arms {
+            assert_eq!(arm.from.unwrap().table, "mixed");
+            assert_eq!(arm.columns[0].expr.to_string(), "integer_value");
+            assert_eq!(arm.columns[1].expr.to_string(), "real_value");
+        }
     }
 
     #[test]
@@ -1731,6 +2751,417 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_groups_start_at_the_from_table() {
+        use crate::policy::JoinConfig;
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 3,
+                parenthesized_group_probability: 1.0,
+                ..Default::default()
+            },
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .table(Table::new(
+                "orders",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("user_id", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_aliased_group = false;
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let group_count: usize = select
+                .joins
+                .iter()
+                .map(|join| join.closed_groups.len())
+                .sum();
+            assert!(group_count >= 1);
+            let sql = select.to_string();
+            let from = format!(" FROM {}", "(".repeat(group_count));
+            assert!(sql.contains(&from), "{sql}");
+            found_aliased_group |= select
+                .joins
+                .iter()
+                .any(|join| join.closed_groups.iter().any(Option::is_some));
+        }
+        assert!(found_aliased_group);
+    }
+
+    #[test]
+    fn right_and_full_join_generation_covers_predicates_and_chains() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let mut policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 3,
+                join_type_weights: JoinTypeWeights {
+                    inner: 0,
+                    left: 0,
+                    right: 1,
+                    full: 1,
+                    cross: 0,
+                },
+                natural_join_probability: 0.0,
+                join_constraint_probability: 1.0,
+                using_probability: 0.0,
+                equi_join_probability: 0.5,
+                self_join_probability: 0.25,
+                parenthesized_group_probability: 0.0,
+            },
+            ..Default::default()
+        });
+        policy.max_tables = 4;
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "a",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .table(Table::new(
+                "b",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .table(Table::new(
+                "c",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_right = false;
+        let mut saw_full = false;
+        let mut saw_equality = false;
+        let mut saw_non_equality = false;
+        let mut saw_chain = false;
+        let mut saw_later_left_table = false;
+        let mut saw_repeated_table_alias = false;
+        let mut saw_right_origin = false;
+        let mut saw_full_origin = false;
+        let mut saw_right_condition_coverage = false;
+        let mut saw_full_condition_coverage = false;
+
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            saw_chain |= joins.len() > 1;
+            for join in &joins {
+                saw_right |= join.join_type == JoinType::Right;
+                saw_full |= join.join_type == JoinType::Full;
+                saw_repeated_table_alias |= join.table == "a" && join.alias.is_some();
+                let Some(JoinConstraint::On(Expr::BinaryOp(condition))) = &join.constraint else {
+                    panic!("RIGHT and FULL joins must compare two columns: {join:?}");
+                };
+                saw_equality |= condition.op == BinOp::Eq;
+                saw_non_equality |= condition.op != BinOp::Eq;
+                let Expr::ColumnRef(left) = &condition.left else {
+                    panic!("join left operand must be a column: {condition:?}");
+                };
+                let Expr::ColumnRef(right) = &condition.right else {
+                    panic!("join right operand must be a column: {condition:?}");
+                };
+                assert_ne!(left.table, right.table, "join aliases must be distinct");
+                saw_later_left_table |= left.table.as_deref() != Some("a");
+            }
+            let coverage = ctx.take_coverage();
+            for (path, expression_counts) in &coverage.by_origin {
+                saw_right_origin |= path.0.contains(&Origin::RightJoin);
+                saw_full_origin |= path.0.contains(&Origin::FullJoin);
+                saw_right_condition_coverage |=
+                    path.0.contains(&Origin::RightJoin) && !expression_counts.is_empty();
+                saw_full_condition_coverage |=
+                    path.0.contains(&Origin::FullJoin) && !expression_counts.is_empty();
+            }
+        }
+
+        assert!(saw_right, "generator did not create a right join");
+        assert!(saw_full, "generator did not create a full join");
+        assert!(
+            saw_equality,
+            "generator did not create an equality condition"
+        );
+        assert!(
+            saw_non_equality,
+            "generator did not create a non-equality condition"
+        );
+        assert!(saw_chain, "generator did not create a join chain");
+        assert!(
+            saw_later_left_table,
+            "a chained join never used a prior joined table"
+        );
+        assert!(
+            saw_repeated_table_alias,
+            "a repeated table never received an alias"
+        );
+        assert!(saw_right_origin, "right join coverage was not recorded");
+        assert!(saw_full_origin, "full join coverage was not recorded");
+        assert!(
+            saw_right_condition_coverage,
+            "right join condition coverage was not recorded"
+        );
+        assert!(
+            saw_full_condition_coverage,
+            "full join condition coverage was not recorded"
+        );
+    }
+
+    #[test]
+    fn right_and_full_join_generation_covers_using_natural_and_no_constraint() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 1,
+                join_type_weights: JoinTypeWeights {
+                    inner: 0,
+                    left: 0,
+                    right: 1,
+                    full: 1,
+                    cross: 0,
+                },
+                natural_join_probability: 0.25,
+                join_constraint_probability: 0.75,
+                using_probability: 0.5,
+                self_join_probability: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "a",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut saw_natural_right = false;
+        let mut saw_natural_full = false;
+        let mut saw_using = false;
+        let mut saw_no_constraint = false;
+
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            let join = &joins[0];
+            saw_natural_right |= join.natural && join.join_type == JoinType::Right;
+            saw_natural_full |= join.natural && join.join_type == JoinType::Full;
+            saw_using |= matches!(&join.constraint, Some(JoinConstraint::Using(columns)) if columns == &["x"]);
+            saw_no_constraint |= !join.natural && join.constraint.is_none();
+            if join.natural {
+                assert!(
+                    join.constraint.is_none(),
+                    "NATURAL JOIN cannot use ON or USING"
+                );
+            }
+        }
+
+        assert!(
+            saw_natural_right,
+            "generator did not create NATURAL RIGHT JOIN"
+        );
+        assert!(
+            saw_natural_full,
+            "generator did not create NATURAL FULL JOIN"
+        );
+        assert!(saw_using, "generator did not create a USING clause");
+        assert!(
+            saw_no_constraint,
+            "generator did not create a join without a constraint"
+        );
+    }
+
+    #[test]
+    fn natural_join_does_not_need_a_shared_column_name() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 1,
+                join_type_weights: JoinTypeWeights {
+                    inner: 1,
+                    left: 0,
+                    right: 0,
+                    full: 0,
+                    cross: 0,
+                },
+                natural_join_probability: 1.0,
+                self_join_probability: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "a",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .table(Table::new(
+                "b",
+                vec![ColumnDef::new("y", DataType::Integer)],
+            ))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..20 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            if joins[0].table == "b" {
+                assert_eq!(joins[0].join_type, JoinType::Inner);
+                assert!(joins[0].natural);
+                assert!(joins[0].constraint.is_none());
+                return;
+            }
+        }
+
+        panic!("generator did not select the table with a different column name");
+    }
+
+    #[test]
+    fn inner_join_before_right_join_does_not_use_an_ambiguous_column() {
+        use crate::policy::{JoinConfig, JoinTypeWeights};
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 3,
+                join_type_weights: JoinTypeWeights {
+                    inner: 1,
+                    left: 0,
+                    right: 1,
+                    full: 0,
+                    cross: 0,
+                },
+                natural_join_probability: 0.0,
+                join_constraint_probability: 1.0,
+                using_probability: 0.5,
+                self_join_probability: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let table = |name: &str| Table::new(name, vec![ColumnDef::new("x", DataType::Integer)]);
+        let schema = SchemaBuilder::new()
+            .table(table("a"))
+            .table(table("b"))
+            .table(table("c"))
+            .table(table("d"))
+            .build();
+        let first_table = schema.tables[0].clone();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let uses_x = |join: &JoinClause| matches!(&join.constraint, Some(JoinConstraint::Using(columns)) if columns == &["x"]);
+        let mut saw_inner_join_on_before_right_join = false;
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            let joins = ctx
+                .with_table_scope([(first_table.clone(), None)], |ctx| {
+                    generate_join_clauses(&generator, ctx)
+                })
+                .unwrap();
+            let Some(right_join) = joins
+                .iter()
+                .position(|join| join.join_type == JoinType::Right)
+            else {
+                continue;
+            };
+            saw_inner_join_on_before_right_join |=
+                joins[..right_join].iter().any(|join| !uses_x(join));
+            assert!(
+                joins
+                    .iter()
+                    .skip_while(|join| uses_x(join))
+                    .all(|join| !uses_x(join)),
+                "USING(x) after a join that did not merge x is ambiguous: {joins:?}"
+            );
+        }
+        assert!(saw_inner_join_on_before_right_join);
+    }
+
+    #[test]
+    fn right_and_full_natural_join_require_repeated_left_names_to_be_merged() {
+        let table = |name: &str| Table::new(name, vec![ColumnDef::new("x", DataType::Integer)]);
+        let mut ctx = Context::new_with_seed(1);
+        let unmerged_join = JoinClause {
+            join_type: JoinType::Inner,
+            natural: false,
+            table: "b".to_string(),
+            alias: None,
+            constraint: None,
+            closed_groups: vec![],
+        };
+        let merged_join = JoinClause {
+            constraint: Some(JoinConstraint::Using(vec!["x".to_string()])),
+            ..unmerged_join.clone()
+        };
+
+        ctx.with_table_scope(
+            [(table("a"), None), (table("b"), None), (table("c"), None)],
+            |ctx| {
+                assert!(natural_join_has_ambiguous_column(
+                    ctx,
+                    std::slice::from_ref(&unmerged_join)
+                ));
+                assert!(!natural_join_has_ambiguous_column(
+                    ctx,
+                    std::slice::from_ref(&merged_join)
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn using_clause_does_not_repeat_a_column_name() {
+        let mut ctx = Context::new_with_seed(1);
+        let left = Table::new("a", vec![ColumnDef::new("x", DataType::Integer)]);
+        let right = Table::new(
+            "b",
+            vec![
+                ColumnDef::new("x", DataType::Integer),
+                ColumnDef::new("x", DataType::Integer),
+            ],
+        );
+
+        let columns = ctx.with_table_scope([(left, None), (right, None)], |ctx| {
+            generate_join_using_columns(ctx, &[], true)
+        });
+
+        assert_eq!(columns, ["x"]);
+    }
+
+    #[test]
     fn test_join_generates_qualified_columns() {
         use crate::policy::JoinConfig;
 
@@ -2002,6 +3433,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scalar_aggregate_subquery_can_reference_an_outer_column() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            subquery_where_probability: 0.0,
+            subquery_correlation_probability: 1.0,
+            subquery_aggregate_probability: 1.0,
+            subquery_group_by_probability: 0.0,
+            subquery_order_by_probability: 0.0,
+            ..Default::default()
+        });
+        let outer = Table::new("outer_rows", vec![ColumnDef::new("key", DataType::Integer)]);
+        let schema = SchemaBuilder::new()
+            .table(outer.clone())
+            .table(Table::new(
+                "inner_rows",
+                vec![
+                    ColumnDef::new("key", DataType::Integer),
+                    ColumnDef::new("amount", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(7);
+        let select = ctx
+            .with_table_scope([(outer, Some("outer".to_string()))], |ctx| {
+                generate_select_impl(&generator, ctx, SelectMode::Scalar)
+            })
+            .unwrap();
+        let sql = select.to_string();
+
+        assert!(
+            select.limit.is_none(),
+            "one aggregate row needs no LIMIT: {sql}"
+        );
+        assert!(
+            select.columns[0].expr.contains_aggregate(),
+            "expected an aggregate result: {sql}"
+        );
+        assert!(sql.contains("outer.key"), "expected outer reference: {sql}");
+        assert!(ctx.take_generated_correlated_subquery());
+    }
+
+    #[test]
+    fn semi_join_subqueries_can_reference_an_outer_column() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            subquery_where_probability: 0.0,
+            subquery_correlation_probability: 1.0,
+            ..Default::default()
+        });
+        let outer = Table::new("outer_rows", vec![ColumnDef::new("key", DataType::Integer)]);
+        let schema = SchemaBuilder::new()
+            .table(outer.clone())
+            .table(Table::new(
+                "inner_rows",
+                vec![
+                    ColumnDef::new("key", DataType::Integer),
+                    ColumnDef::new("amount", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for mode in [SelectMode::Exists, SelectMode::In] {
+            let mut ctx = Context::new_with_seed(7);
+            let select = ctx
+                .with_table_scope([(outer.clone(), Some("outer".to_string()))], |ctx| {
+                    generate_select_impl(&generator, ctx, mode)
+                })
+                .unwrap();
+            let sql = select.to_string();
+
+            assert_eq!(select.columns.len(), 1, "expected one result: {sql}");
+            assert!(select.limit.is_none(), "expected no LIMIT: {sql}");
+            assert!(select.group_by.is_none(), "expected no GROUP BY: {sql}");
+            assert!(select.order_by.is_empty(), "expected no ORDER BY: {sql}");
+            assert!(!select.distinct, "expected no DISTINCT: {sql}");
+            assert!(sql.contains("outer.key"), "expected outer reference: {sql}");
+            assert!(ctx.take_generated_correlated_subquery());
+        }
+    }
+
+    #[test]
+    fn supported_correlation_keys_vary_count_and_operand_order() {
+        let outer = Table::new(
+            "outer_rows",
+            vec![
+                ColumnDef::new("key1", DataType::Integer),
+                ColumnDef::new("key2", DataType::Integer),
+            ],
+        );
+        let inner = Table::new(
+            "inner_rows",
+            vec![
+                ColumnDef::new("key1", DataType::Integer),
+                ColumnDef::new("key2", DataType::Integer),
+            ],
+        );
+        let mut saw_two_keys = false;
+        let mut saw_outer_column_on_left = false;
+        let mut saw_inner_column_on_left = false;
+
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let predicate =
+                ctx.with_table_scope([(outer.clone(), Some("outer".to_string()))], |ctx| {
+                    ctx.with_table_scope(
+                        [(inner.clone(), Some("inner".to_string()))],
+                        generate_supported_correlation_predicate,
+                    )
+                });
+            let sql = predicate
+                .expect("matching key types should correlate")
+                .to_string();
+            saw_two_keys |= sql.matches(" = ").count() == 2;
+            for equality in sql.split(" AND ") {
+                saw_outer_column_on_left |= equality.starts_with("outer.");
+                saw_inner_column_on_left |= equality.starts_with("inner.");
+            }
+        }
+
+        assert!(saw_two_keys, "expected at least one composite correlation");
+        assert!(
+            saw_outer_column_on_left && saw_inner_column_on_left,
+            "expected both equality operand orders"
+        );
     }
 
     #[test]

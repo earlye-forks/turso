@@ -10,15 +10,27 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("{0}")]
+    IoBackendUnavailable(String),
+    /// An error raised by emitted bytecode (`Insn::Halt` with SQLITE_ERROR),
+    /// e.g. ALTER TABLE validation or window-function argument checks.
+    /// Displayed bare, like sqlite3_errmsg. Kept distinct from `Constraint`
+    /// so `abort()` does not apply ON CONFLICT resolution to it.
+    #[error("{0}")]
+    SqlError(String),
     #[error(transparent)]
     CacheError(#[from] CacheError),
-    #[error("Database is full: {0}")]
-    DatabaseFull(String),
+    #[error("database or disk is full")]
+    DatabaseFull,
+    #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
+    SequenceExhausted { name: String, ascending: bool },
     #[error("Parse error: {0}")]
     ParseError(String),
+    /// Boxed: the parser error is ~96 bytes inline and would dominate
+    /// `LimboError`'s size, which rides in every hot-path `Result`.
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] turso_parser::error::Error),
+    LexerError(#[from] Box<turso_parser::error::Error>),
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
@@ -39,29 +51,29 @@ pub enum LimboError {
     InvalidTime(String),
     #[error("Modifier parsing error: {0}")]
     InvalidModifier(String),
-    #[error("Invalid argument supplied: {0}")]
+    #[error("{0}")]
     InvalidArgument(String),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
-    #[error("Runtime error: {0}")]
+    #[error("{0}")]
     Constraint(String),
-    #[error("Runtime error: {0}")]
+    #[error("{0}")]
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
-    #[error("Runtime error: {1}")]
+    #[error("{1}")]
     Raise(turso_parser::ast::ResolveType, String),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
     ExtensionError(String),
-    #[error("Runtime error: integer overflow")]
+    #[error("integer overflow")]
     IntegerOverflow,
-    #[error("Runtime error: string or blob too big")]
+    #[error("string or blob too big")]
     TooBig,
-    #[error("Runtime error: database table is locked")]
+    #[error("database table is locked")]
     TableLocked,
-    #[error("Error: Resource is read-only")]
+    #[error("attempt to write a readonly database")]
     ReadOnly,
     #[error("Database is busy")]
     Busy,
@@ -103,6 +115,12 @@ pub enum LimboError {
     InvalidColumnType,
     #[error("Invalid blob size, expected {0}")]
     InvalidBlobSize(usize),
+    /// An incremental-blob handle was invalidated because the row it points to
+    /// (or its table) was modified after the handle was opened. Mirrors SQLite's
+    /// expired blob handles: every subsequent read/write must fail with
+    /// SQLITE_ABORT until the handle is closed.
+    #[error("blob handle expired")]
+    BlobHandleExpired,
     #[error("Planning error: {0}")]
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]
@@ -111,11 +129,70 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
-    /// The active IO backend does not implement a required IO extension
-    /// (the payload names the `IO` method). Features that depend on the
-    /// extension refuse to run rather than fall back to a weaker guarantee.
-    #[error("IO extension not supported by the active IO backend: {0}")]
+    #[error("the IO backend does not support {0}")]
     IoExtensionUnsupported(&'static str),
+}
+
+/// `?` in functions returning boxed errors (see `InsnResult`) composes
+/// `From<X> for LimboError` with the boxing. One impl per source error type
+/// that crosses that boundary; a blanket impl would overlap std's
+/// `From<T> for Box<T>`.
+macro_rules! boxed_from {
+    ($ty:ty) => {
+        impl From<$ty> for Box<LimboError> {
+            fn from(err: $ty) -> Self {
+                Box::new(LimboError::from(err))
+            }
+        }
+    };
+}
+boxed_from!(crate::alloc::TryReserveError);
+boxed_from!(std::collections::TryReserveError);
+boxed_from!(turso_parser::error::Error);
+boxed_from!(CompletionError);
+boxed_from!(CacheError);
+boxed_from!(bumpalo::AllocErr);
+boxed_from!(crate::alloc::AllocError);
+
+impl From<Box<LimboError>> for LimboError {
+    fn from(err: Box<LimboError>) -> Self {
+        *err
+    }
+}
+
+impl From<turso_parser::error::Error> for LimboError {
+    fn from(err: turso_parser::error::Error) -> Self {
+        LimboError::LexerError(Box::new(err))
+    }
+}
+
+impl LimboError {
+    /// The primary SQLite result code for this error, e.g. what the sqlite3
+    /// shell appends after a runtime error message ("... (19)").
+    pub fn sqlite_result_code(&self) -> i32 {
+        match self {
+            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
+            Self::TableLocked => 6,
+            Self::ReadOnly => 8,
+            Self::Interrupt => 9,
+            Self::Corrupt(_) => 11,
+            Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
+            Self::SchemaUpdated | Self::SchemaConflict => 17,
+            Self::TooBig => 18,
+            Self::NotADB => 26,
+            Self::BlobHandleExpired => 4,
+            _ => 1,
+        }
+    }
+}
+
+fn sequence_bound(ascending: &bool) -> &'static str {
+    if *ascending {
+        "maximum"
+    } else {
+        "minimum"
+    }
 }
 
 impl From<crate::alloc::AllocError> for LimboError {
@@ -184,6 +261,8 @@ pub enum CompletionError {
     Aborted,
     #[error("Decryption failed for page={page_idx}")]
     DecryptionError { page_idx: usize },
+    #[error("Page codec failed for page={page_idx}")]
+    PageCodecError { page_idx: usize },
     #[error("I/O error: partial write")]
     ShortWrite,
     #[error("I/O error: short read on page {page_idx}: expected {expected} bytes, got {actual}")]
@@ -225,17 +304,29 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
     v
 }
 
+/// Builds the error for [bail_parse_error!]. The message is formatted here, out
+/// of line, so that the many functions that can fail with a parse error do not
+/// each hold the formatting temporaries in their stack frames. This matters
+/// for the functions that translate expressions, which recurse once per level
+/// of an expression.
+#[doc(hidden)]
+#[cold]
+#[inline(never)]
+pub fn parse_error(message: std::fmt::Arguments<'_>) -> LimboError {
+    LimboError::ParseError(std::fmt::format(message))
+}
+
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::parse_error(format_args!($($arg)*)).into()))
     };
 }
 
 #[macro_export]
 macro_rules! bail_corrupt_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*)).into()))
     };
 }
 
@@ -271,7 +362,7 @@ macro_rules! assert_or_bail_corrupt {
 #[macro_export]
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*)).into()))
     };
 }
 

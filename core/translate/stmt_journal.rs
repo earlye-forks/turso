@@ -151,7 +151,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     let has_check = !table.check_constraints.is_empty();
     // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
     // constraint clause is declared on the table: `op_sequence_compute_next`
-    // returns `LimboError::DatabaseFull` on i64 exhaustion, and a second
+    // returns `LimboError::DatabaseFull` on rowid exhaustion, and a second
     // row that exhausts mid-statement must not leak the first row's
     // table write past the next COMMIT — that breaks SQLite's
     // per-statement atomicity contract. Single-row AUTOINCREMENT
@@ -231,8 +231,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
-    let is_single_row =
-        plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
+    let is_single_row = target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !any_replace && !has_fks {
         program.set_multi_write(false);
     }
@@ -286,8 +285,7 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
-    let is_single_row =
-        plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
+    let is_single_row = target_table.op.affects_max_1_row();
     if is_single_row && !has_triggers && !has_fks {
         program.set_multi_write(false);
     }

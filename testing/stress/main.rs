@@ -1,6 +1,8 @@
 use rand::Rng;
+mod checkpoint;
 mod conn;
 mod counter;
+mod fts;
 mod logging;
 mod opts;
 mod progress;
@@ -580,13 +582,19 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     // Generate schema upfront on main thread with seed
     let mut main_rng = ThreadRng::new(global_seed);
-    let schema = if let Some(ref db_ref) = opts.db_ref {
+    let schema = if opts.fts {
+        ArbitrarySchema { tables: vec![] }
+    } else if let Some(ref db_ref) = opts.db_ref {
         load_schema(db_ref)?
     } else {
         gen_schema(&mut main_rng, opts.tables)
     };
 
-    let ddl_statements = schema.to_sql();
+    let ddl_statements = if opts.fts {
+        fts::schema(opts.tables.unwrap_or(1))
+    } else {
+        schema.to_sql()
+    };
     let schema = Arc::new(schema);
 
     let mut stop = false;
@@ -620,6 +628,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         db_file.clone(),
         sql_logger.clone(),
         vfs_option.clone(),
+        opts.fts,
     )));
 
     let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
@@ -675,16 +684,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         }
     };
 
+    let mut batch_idx: u64 = 0;
     while !stop && !stress_counter.all_done() {
         let mut handles = Vec::with_capacity(opts.nr_threads);
         let reopen_requested = Arc::new(AtomicBool::new(false));
         let all_threads_ready = Arc::new(Barrier::new(stress_counter.incomplete_threads()));
 
-        for (iteration_idx, ((thread_idx, thread), mut progress_bar)) in threads
-            .iter()
-            .cloned()
-            .zip(progress_bars.iter().cloned())
-            .enumerate()
+        for ((thread_idx, thread), mut progress_bar) in
+            threads.iter().cloned().zip(progress_bars.iter().cloned())
         {
             if stress_counter.done(thread_idx) {
                 continue;
@@ -704,7 +711,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 let mut rng = ThreadRng::new(
                     global_seed
                         .wrapping_add(thread_idx as u64)
-                        .wrapping_add(iteration_idx as u64 * 1000),
+                        .wrapping_add(batch_idx.wrapping_mul(1000)),
                 );
                 let mut iteration_count_this_batch = 0;
 
@@ -727,10 +734,20 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         let _ = conn.execute(tx_stmt, ()).await;
                     }
 
-                    let sql = generate_random_statement(&mut rng, &schema_for_task);
-
-                    if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
-                        turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
+                    if opts.fts {
+                        fts::run(
+                            &conn,
+                            &mut rng,
+                            opts.tables.unwrap_or(1),
+                            &sql_logger,
+                            &thread,
+                        )
+                        .await;
+                    } else {
+                        let sql = generate_random_statement(&mut rng, &schema_for_task);
+                        if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
+                            turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
+                        }
                     }
 
                     // When inside a transaction, 30% chance to exercise savepoints.
@@ -745,9 +762,22 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         // Execute 1-3 DML statements inside the savepoint.
                         let sp_stmts = rng.random_range(1..4) as usize;
                         for _ in 0..sp_stmts {
-                            let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
-                            if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
-                                turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
+                            if opts.fts {
+                                fts::run(
+                                    &conn,
+                                    &mut rng,
+                                    opts.tables.unwrap_or(1),
+                                    &sql_logger,
+                                    &thread,
+                                )
+                                .await;
+                            } else {
+                                let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
+                                if let Err(turso::Error::Corrupt(e)) =
+                                    conn.execute(&sp_sql, ()).await
+                                {
+                                    turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
+                                }
                             }
                         }
 
@@ -765,37 +795,52 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         let _ = conn.execute(end_tx, ()).await;
                     }
 
+                    // Occasionally checkpoint the WAL so backfills, full
+                    // drains, and WAL restarts race the other threads'
+                    // commits instead of only happening on autocheckpoint.
+                    if rng.random_ratio(1, 20) {
+                        let mode = checkpoint::pick_mode(&mut rng, opts.tx_mode);
+                        checkpoint::run_wal_checkpoint(
+                            &conn,
+                            &sql_logger,
+                            &thread,
+                            mode,
+                            opts.tx_mode,
+                        )
+                        .await;
+                    }
+
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
-                    if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
-                        let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                        match res.next().await {
-                            Ok(Some(row))
-                                if Value::Text("ok".into()) == row.get_value(0).unwrap() =>
-                            {
-                                sql_logger.log(&thread, "PRAGMA integrity_check", "OK");
+                    if !opts.skip_integrity_check && interaction_idx % INTEGRITY_CHECK_INTERVAL == 0
+                    {
+                        let sql = "PRAGMA integrity_check";
+                        let result: turso::Result<Vec<Value>> = async {
+                            let mut result_rows = conn.query(sql, ()).await?;
+                            let mut rows = Vec::new();
+                            while let Some(row) = result_rows.next().await? {
+                                rows.push(row.get_value(0)?);
                             }
-                            Ok(Some(row)) => {
-                                let mut rows = vec![row.get_value(0).unwrap()];
-                                while let Some(r) = res.next().await? {
-                                    rows.push(r.get_value(0).unwrap());
-                                }
-                                sql_logger.log(
-                                    &thread,
-                                    "PRAGMA integrity_check",
-                                    &format!("ERROR: {rows:?}"),
-                                );
-                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "rows": rows });
+                            Ok(rows)
+                        }
+                        .await;
+                        match result {
+                            Ok(rows) if rows == [Value::Text("ok".into())] => {
+                                sql_logger.log(&thread, sql, "OK");
                             }
-                            Ok(None) => {
-                                sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
+                            Ok(rows) if rows.is_empty() => {
+                                sql_logger.log(&thread, sql, "ERROR: no rows");
                                 turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
                             }
+                            Ok(rows) => {
+                                sql_logger.log(&thread, sql, &format!("ERROR: {rows:?}"));
+                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "rows": rows });
+                            }
+                            Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
+                                sql_logger.log(&thread, sql, "SKIPPED: database busy");
+                                conn.rollback_if_open().await?;
+                            }
                             Err(e) => {
-                                sql_logger.log(
-                                    &thread,
-                                    "PRAGMA integrity_check",
-                                    &format!("ERROR: {e}"),
-                                );
+                                sql_logger.log(&thread, sql, &format!("ERROR: {e}"));
                                 turso_macros::turso_assert_unreachable!("Error performing integrity check", { "thread": thread, "error": e });
                             }
                         }
@@ -831,6 +876,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         // This is what triggers MVCC recovery
         db.lock().await.reset();
         clear_database_registry();
+        batch_idx += 1;
     }
 
     progress_bars
@@ -839,24 +885,90 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     println!("Database file: {db_file}");
 
-    // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
-    // SQLite/rusqlite doesn't understand MVCC journal mode.
-    if opts.tx_mode == TxMode::Concurrent {
-        let mut builder = Builder::new_local(&db_file);
-        if let Some(ref vfs) = vfs_option {
-            builder = builder.with_io(vfs.clone());
+    if opts.fts && !stop {
+        let thread = ThreadId::new(usize::MAX);
+        let conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+        for table in 0..opts.tables.unwrap_or(1) {
+            for token in fts::TOKENS {
+                fts::check(&conn, table, token, &sql_logger, &thread).await?;
+            }
         }
-        let db = builder.build().await?;
-        let conn = db.connect()?;
-        conn.pragma_update("journal_mode", "WAL").await?;
-        println!("Switched journal mode back to WAL for SQLite integrity check");
+        if !opts.skip_integrity_check {
+            println!("Running Turso integrity check (FTS schema is not SQLite-compatible)");
+            let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().await? {
+                results.push(row.get::<String>(0)?);
+            }
+            turso_macros::turso_assert!(
+                !results.is_empty(),
+                "FTS integrity check returned no rows",
+                { "path": db_file, "results": results }
+            );
+            turso_macros::turso_assert_eq!(
+                results.as_slice(),
+                ["ok"],
+                "FTS database integrity check failed",
+                { "path": db_file, "results": results }
+            );
+        }
     }
 
     #[cfg(not(miri))]
-    {
+    if !opts.skip_integrity_check && !opts.fts {
+        // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
+        // SQLite/rusqlite doesn't understand MVCC journal mode.
+        if opts.tx_mode == TxMode::Concurrent {
+            let mut builder = Builder::new_local(&db_file);
+            if let Some(ref vfs) = vfs_option {
+                builder = builder.with_io(vfs.clone());
+            }
+            let db = builder.build().await?;
+            let conn = db.connect()?;
+            conn.pragma_update("journal_mode", "WAL").await?;
+            println!("Switched journal mode back to WAL for SQLite integrity check");
+        }
         println!("Running SQLite Integrity check");
         sqlite_integrity_check(std::path::Path::new(&db_file))?;
     }
 
     Ok(())
+}
+
+#[cfg(all(test, not(shuttle)))]
+mod rollback_tests {
+    use crate::conn::StressDb;
+    use crate::sql_logging::SqlLogger;
+    use turso::Value;
+    use turso_stress::sync::{Arc, AsyncMutex};
+    use turso_stress::ThreadId;
+
+    #[tokio::test]
+    async fn rollback_open_transaction_discards_uncommitted_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("test.db");
+        let sql_log = dir.path().join("test.sql");
+        let logger = Arc::new(SqlLogger::new(sql_log.to_str().unwrap()).unwrap());
+        let db = Arc::new(AsyncMutex::new(StressDb::new(
+            db_file.to_str().unwrap().to_owned(),
+            logger,
+            None,
+            false,
+        )));
+        let conn = StressDb::connect(&db, ThreadId::new(0), 1000)
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        conn.rollback_if_open().await.unwrap();
+        conn.execute("BEGIN", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+
+        conn.rollback_if_open().await.unwrap();
+
+        let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+        let count = rows.next().await.unwrap().unwrap().get_value(0).unwrap();
+        assert_eq!(count, Value::Integer(0));
+    }
 }

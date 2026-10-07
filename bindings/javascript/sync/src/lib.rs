@@ -13,7 +13,7 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{sync_database_file_paths, DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
     types::{
@@ -163,7 +163,9 @@ pub struct SyncEngineOpts {
     /// `None` (default) bootstraps in a single round-trip. No-op when
     /// partial-sync uses the query bootstrap strategy.
     pub pull_bytes_threshold: Option<u32>,
-    /// Use MVCC logical-log stream for incremental V1 pulls.
+    /// Sync-protocol override for incremental pulls. Unset (default)
+    /// auto-detects the remote protocol from the first pull-updates response;
+    /// `true` forces MVCC logical-log streams; `false` forces page streams.
     pub logical_mvcc_pull: Option<bool>,
 }
 
@@ -183,7 +185,7 @@ struct SyncEngineOptsFilled {
     pub partial_sync_opts: Option<PartialSyncOpts>,
     pub push_operations_threshold: Option<usize>,
     pub pull_bytes_threshold: Option<usize>,
-    pub logical_mvcc_pull: bool,
+    pub logical_mvcc_pull: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,7 +338,7 @@ impl SyncEngine {
             remote_encryption_key: opts.remote_encryption_key.clone(),
             push_operations_threshold: opts.push_operations_threshold.map(|x| x as usize),
             pull_bytes_threshold: opts.pull_bytes_threshold.map(|x| x as usize),
-            logical_mvcc_pull: opts.logical_mvcc_pull.unwrap_or(false),
+            logical_mvcc_pull: opts.logical_mvcc_pull,
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -347,6 +349,11 @@ impl SyncEngine {
             #[allow(clippy::arc_with_non_send_sync)]
             db,
         })
+    }
+
+    #[napi]
+    pub fn file_paths(&self) -> Vec<String> {
+        sync_database_file_paths(&self.opts.path)
     }
 
     #[napi]
@@ -367,7 +374,11 @@ impl SyncEngine {
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
-            remote_encryption_key: self.opts.remote_encryption_key.clone(),
+            remote_encryption_key: self
+                .opts
+                .remote_encryption_key
+                .clone()
+                .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
             logical_mvcc_pull: self.opts.logical_mvcc_pull,

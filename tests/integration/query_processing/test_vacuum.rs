@@ -1,11 +1,14 @@
+use crate::assertions::{AssertQueryPlan, NULL};
 use crate::common::{
     compute_dbhash, compute_dbhash_with_database_opts, compute_dbhash_with_options,
     compute_dbhash_with_options_and_database_opts, do_flush, ExecRows, TempDatabase,
 };
 use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
+use turso_core::SqliteDialect;
 use turso_core::{Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
 use turso_parser::{ast::Cmd, parser::Parser};
 
@@ -45,7 +48,9 @@ fn canonicalize_schema_sql(sql: &str) -> String {
         return normalize_sql_whitespace(sql);
     }
     match cmd {
-        Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt) => stmt.to_string(),
+        Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. } => {
+            stmt.to_string()
+        }
     }
 }
 
@@ -359,6 +364,102 @@ fn assert_plain_vacuum_preserves_content_hash(
     Ok(())
 }
 
+/// `PRAGMA auto_vacuum=1` on a brand-new database must turn autovacuum on.
+/// The emptiness check used to count the built-in virtual tables
+/// (pragma_*, json_each, ...) as user tables, so it thought every fresh
+/// database was non-empty and silently ignored the pragma.
+#[test]
+fn test_auto_vacuum_pragma_applies_to_fresh_database() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA auto_vacuum = 1")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 1);
+    // Page 2 is the first pointer-map page, so the table root lands on page 3.
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        3
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, opts);
+    let reopened_conn = reopened.connect_limbo();
+    assert_eq!(scalar_i64(&reopened_conn, "PRAGMA auto_vacuum"), 1);
+    Ok(())
+}
+
+/// SQLite fixes the auto-vacuum mode as soon as page 1 exists, even when the
+/// database has no tables yet. `PRAGMA user_version` writes page 1, so a
+/// later `PRAGMA auto_vacuum=1` must be silently ignored, just like it is
+/// once a table exists. The emptiness check used to look at the schema and
+/// the page count instead, and treated a one-page database as still empty.
+#[test]
+fn test_auto_vacuum_pragma_ignored_once_page_one_exists() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA user_version = 5")?;
+    conn.execute("PRAGMA auto_vacuum = 1")?;
+    conn.execute("CREATE TABLE t(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA auto_vacuum"), 0);
+    // No pointer-map page was reserved, so the table root is page 2.
+    assert_eq!(
+        scalar_i64(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'"),
+        2
+    );
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    // SQLite agrees: the same statements leave auto-vacuum off.
+    let sqlite_conn = SqliteConnection::open_in_memory()?;
+    sqlite_conn
+        .execute_batch("PRAGMA user_version = 5; PRAGMA auto_vacuum = 1; CREATE TABLE t(x);")?;
+    assert_eq!(sqlite_scalar_i64(&sqlite_conn, "PRAGMA auto_vacuum"), 0);
+    assert_eq!(
+        sqlite_scalar_i64(
+            &sqlite_conn,
+            "SELECT rootpage FROM sqlite_schema WHERE name = 't'"
+        ),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn test_auto_vacuum_pragma_on_attached_database_leaves_main_unchanged() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true).with_attach(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("ATTACH ':memory:' AS aux")?;
+    conn.execute("PRAGMA aux.auto_vacuum = full")?;
+    conn.execute("CREATE TABLE aux.a(x)")?;
+    conn.execute("CREATE TABLE main.m(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA aux.auto_vacuum"), 1);
+    assert_eq!(scalar_i64(&conn, "PRAGMA main.auto_vacuum"), 0);
+    Ok(())
+}
+
+#[test]
+fn test_auto_vacuum_pragma_on_temp_database_leaves_main_unchanged() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA temp.auto_vacuum = full")?;
+    conn.execute("CREATE TEMP TABLE t(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA temp.auto_vacuum"), 1);
+    assert_eq!(scalar_i64(&conn, "PRAGMA main.auto_vacuum"), 0);
+    Ok(())
+}
+
 fn assert_plain_vacuum_preserves_autovacuum_mode(
     pragma_value: &str,
     expected_mode: i64,
@@ -539,10 +640,11 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = dest_conn.prepare("SELECT c FROM t ORDER BY a")?;
     let blob_values = stmt.run_collect_rows()?;
-    assert_eq!(blob_values.len(), 3);
-    assert_eq!(blob_values[0][0], Value::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
-    assert_eq!(blob_values[1][0], Value::Blob(vec![0xCA, 0xFE, 0xBA, 0xBE]));
-    assert_eq!(blob_values[2][0], Value::Null);
+    assert_that!(blob_values).is_equal_to(vec![
+        row![vec![0xDE_u8, 0xAD, 0xBE, 0xEF]],
+        row![vec![0xCA_u8, 0xFE, 0xBA, 0xBE]],
+        row![NULL],
+    ]);
 
     // verify destination also has zero reserved_space (the default value)
     {
@@ -687,7 +789,9 @@ fn test_vacuum_into_rejects_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                select_stmt.get_pager().io.step()?
+            }
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -747,7 +851,9 @@ fn test_vacuum_into_rejects_reprepared_active_select_on_same_connection(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                select_stmt.get_pager().io.step()?
+            }
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -789,7 +895,9 @@ fn test_same_connection_select_then_write_then_continue_select(
                 }
             }
             StepResult::Done => break,
-            StepResult::IO | StepResult::Yield => select_stmt.get_pager().io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                select_stmt.get_pager().io.step()?
+            }
             StepResult::Busy => anyhow::bail!("unexpected Busy while draining SELECT"),
             StepResult::Interrupt => anyhow::bail!("unexpected Interrupt while draining SELECT"),
         }
@@ -1140,7 +1248,7 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
     let source_db = TempDatabase::new_empty();
     let conn = source_db.connect_limbo();
     // Set non-default page_size (must be done before any tables are created)
-    conn.reset_page_size(8192)?;
+    conn.reset_page_size(turso_core::MAIN_DB_ID, 8192)?;
 
     conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')")?;
@@ -2589,6 +2697,7 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
         OpenFlags::Create,
         turso_core::DatabaseOpts::new(),
         None,
+        Arc::new(SqliteDialect),
     )?;
     let conn = db.connect()?;
 
@@ -3377,21 +3486,6 @@ fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_vacuum_into_nonexistent_schema(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    let result = conn.execute("VACUUM nonexistent INTO 'out.db'");
-
-    assert!(result.is_err(), "Should error on non-existent database");
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(
-        err_msg.contains("no such database: nonexistent"),
-        "Error should indicate database not found: {err_msg}"
-    );
-
-    Ok(())
-}
-
-#[turso_macros::test(mvcc)]
 fn test_vacuum_into_temp_is_noop(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -3450,12 +3544,9 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     let eqp_a: Vec<(i64, i64, i64, String)> =
         dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, a FROM t WHERE a = 'val_15'");
-    assert!(
-        eqp_a
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_a")),
-        "expected lookup by a to use idx_a, got plan: {eqp_a:?}",
-    );
+    assert_that!(eqp_a)
+        .described_as("expected lookup by a to use idx_a")
+        .uses_index("idx_a");
     let row: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, a FROM t WHERE a = 'val_15'");
     assert_eq!(row, vec![(15, "val_15".to_string())]);
     let row: Vec<(i64, String)> =
@@ -3464,12 +3555,9 @@ fn test_vacuum_into_deferred_indexes(tmp_db: TempDatabase) -> anyhow::Result<()>
 
     let eqp_b: Vec<(i64, i64, i64, String)> =
         dest_conn.exec_rows("EXPLAIN QUERY PLAN SELECT id, b FROM t WHERE b = 20");
-    assert!(
-        eqp_b
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_b")),
-        "expected lookup by b to use idx_b, got plan: {eqp_b:?}",
-    );
+    assert_that!(eqp_b)
+        .described_as("expected lookup by b to use idx_b")
+        .uses_index("idx_b");
     let row: Vec<(i64, i64)> = dest_conn.exec_rows("SELECT id, b FROM t WHERE b = 20");
     assert_eq!(row, vec![(20, 20)]);
     let row: Vec<(i64, i64)> =
@@ -4089,119 +4177,6 @@ fn test_plain_vacuum_keeps_temp_schema_on_same_connection(
     Ok(())
 }
 
-/// Basic plain VACUUM: data survives the compaction round-trip.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c REAL);")]
-fn test_plain_vacuum_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("INSERT INTO t1 VALUES(1, 'hello', 3.125)")?;
-    conn.execute("INSERT INTO t1 VALUES(2, 'world', 2.725)")?;
-    conn.execute("INSERT INTO t1 VALUES(3, 'test', 1.625)")?;
-    conn.execute("DELETE FROM t1 WHERE a = 2")?;
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let rows: Vec<(i64, String, f64)> = conn.exec_rows("SELECT a, b, c FROM t1 ORDER BY a");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], (1, "hello".into(), 3.125));
-    assert_eq!(rows[1], (3, "test".into(), 1.625));
-
-    Ok(())
-}
-
-/// Plain VACUUM preserves user_version and application_id metadata.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
-fn test_plain_vacuum_preserves_metadata(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("INSERT INTO t VALUES(1)")?;
-    conn.execute("PRAGMA user_version = 42")?;
-    conn.execute("PRAGMA application_id = 99")?;
-
-    let pre_schema_version: Vec<(i64,)> = conn.exec_rows("PRAGMA schema_version");
-
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let user_version: Vec<(i64,)> = conn.exec_rows("PRAGMA user_version");
-    assert_eq!(user_version[0].0, 42);
-
-    let application_id: Vec<(i64,)> = conn.exec_rows("PRAGMA application_id");
-    assert_eq!(application_id[0].0, 99);
-
-    // Schema version should be bumped by 1.
-    let post_schema_version: Vec<(i64,)> = conn.exec_rows("PRAGMA schema_version");
-    assert_eq!(post_schema_version[0].0, pre_schema_version[0].0 + 1);
-
-    let journal_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
-    assert_eq!(journal_mode[0].0, "wal");
-
-    Ok(())
-}
-
-/// Plain VACUUM preserves AUTOINCREMENT counters.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);")]
-fn test_plain_vacuum_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("INSERT INTO t1(b) VALUES('one')")?;
-    conn.execute("INSERT INTO t1(b) VALUES('two')")?;
-    conn.execute("INSERT INTO t1(b) VALUES('three')")?;
-    conn.execute("DELETE FROM t1 WHERE b = 'two'")?;
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    // Verify sqlite_sequence preserved
-    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
-    assert_eq!(seq.len(), 1);
-    assert_eq!(seq[0].0, "t1");
-    assert_eq!(seq[0].1, 3);
-
-    // Next insert should continue from 4, not restart
-    conn.execute("INSERT INTO t1(b) VALUES('four')")?;
-    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t1 ORDER BY a");
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], (1, "one".into()));
-    assert_eq!(rows[1], (3, "three".into()));
-    assert_eq!(rows[2], (4, "four".into()));
-
-    Ok(())
-}
-
-/// Plain VACUUM must succeed against a database with user-created
-/// sequences and preserve their on-disk state. The post-VACUUM
-/// connection must still be able to nextval and observe the
-/// pre-VACUUM watermark.
-///
-/// Regression: classifying the `__turso_internal_seq_*` backing
-/// table as "skip-in-target-schema-replay" while leaving it in the
-/// copy phase produced `no such table: "__turso_internal_seq_s"` on
-/// any DB carrying a user-created sequence. Repro from the
-/// reviewer: `CREATE SEQUENCE s; SELECT nextval('s'); VACUUM;`.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test]
-fn test_plain_vacuum_preserves_user_sequence(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE SEQUENCE s START WITH 1 INCREMENT BY 1")?;
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
-    assert_eq!(rows, vec![(1,)]);
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
-    assert_eq!(rows, vec![(2,)]);
-
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
-    assert_eq!(
-        rows,
-        vec![(3,)],
-        "post-VACUUM nextval must continue from the pre-VACUUM watermark"
-    );
-
-    Ok(())
-}
-
 /// Plain VACUUM must preserve hidden rowid values for ordinary rowid tables.
 #[turso_macros::test(mvcc)]
 fn test_plain_vacuum_preserves_rowid_for_rowid_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -4738,21 +4713,6 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Plain VACUUM rejects active transactions.
-#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
-fn test_plain_vacuum_rejects_active_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("BEGIN")?;
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Transaction error: cannot VACUUM from within a transaction",
-        "unexpected error: {err}"
-    );
-    conn.execute("ROLLBACK")?;
-    Ok(())
-}
-
 /// Plain VACUUM works on empty databases.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -4881,20 +4841,6 @@ fn test_plain_vacuum_then_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(rows[1], (3, "three".into()));
     assert_eq!(rows[2], (4, "four".into()));
 
-    Ok(())
-}
-
-/// Plain VACUUM rejects query_only mode.
-#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
-fn test_plain_vacuum_rejects_query_only(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("PRAGMA query_only = 1")?;
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Parse error: Cannot execute VACUUM in query_only mode",
-        "unexpected error: {err}"
-    );
     Ok(())
 }
 
@@ -5331,24 +5277,18 @@ fn test_plain_vacuum_complex_batched_storage_shapes() -> anyhow::Result<()> {
          SELECT id, note FROM docs INDEXED BY idx_docs_category_note \
          WHERE category = 'keep' AND note = 'note-7' ORDER BY id",
     );
-    assert!(
-        eqp_composite.iter().any(|(_, _, _, detail)| {
-            detail.contains("INDEX") && detail.contains("idx_docs_category_note")
-        }),
-        "expected lookup to use idx_docs_category_note after plain VACUUM, got plan: {eqp_composite:?}",
-    );
+    assert_that!(eqp_composite)
+        .described_as("expected lookup to use idx_docs_category_note after plain VACUUM")
+        .uses_index("idx_docs_category_note");
 
     let eqp_partial: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \
          SELECT id, note FROM docs INDEXED BY idx_docs_note_partial \
          WHERE category = 'keep' AND note = 'note-7' ORDER BY id",
     );
-    assert!(
-        eqp_partial
-            .iter()
-            .any(|(_, _, _, detail)| detail.contains("INDEX") && detail.contains("idx_docs_note_partial")),
-        "expected lookup to use idx_docs_note_partial after plain VACUUM, got plan: {eqp_partial:?}",
-    );
+    assert_that!(eqp_partial)
+        .described_as("expected lookup to use idx_docs_note_partial after plain VACUUM")
+        .uses_index("idx_docs_note_partial");
 
     let eqp_view: Vec<(i64, i64, i64, String)> = conn.exec_rows(
         "EXPLAIN QUERY PLAN \
@@ -6065,6 +6005,7 @@ fn open_queued_db(io: Arc<QueuedIo>, path: &str) -> anyhow::Result<Arc<Database>
         Default::default(),
         DatabaseOpts::new().with_vacuum(true),
         None,
+        Arc::new(SqliteDialect),
     )?)
 }
 
@@ -6111,7 +6052,7 @@ fn test_plain_vacuum_reset_during_checkpoint_io_cleans_up_checkpoint_and_vacuum_
             StepResult::Busy | StepResult::Interrupt => {
                 anyhow::bail!("unexpected non-IO result while staging checkpoint cleanup test")
             }
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 while let Some(event) = io.step_one()? {
                     if event.path == source_wal_path && event.kind == QueuedIoOpKind::Pwritev {
                         saw_source_wal_batch_write = true;

@@ -15,6 +15,16 @@ pub struct ParameterInfo {
     pub names: Vec<String>,
 }
 
+/// Output format of an `EXPLAIN QUERY PLAN` statement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EqpFormat {
+    /// `FORMAT=TEXT`
+    #[default]
+    Text,
+    /// `FORMAT=JSON`
+    Json,
+}
+
 /// Statement or Explain statement
 // https://sqlite.org/syntax/sql-stmt.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,7 +32,7 @@ pub enum Cmd {
     /// `EXPLAIN` statement
     Explain(Stmt),
     /// `EXPLAIN QUERY PLAN` statement
-    ExplainQueryPlan(Stmt),
+    ExplainQueryPlan { stmt: Stmt, format: EqpFormat },
     /// statement
     Stmt(Stmt),
 }
@@ -59,10 +69,6 @@ pub struct Update {
     pub where_clause: Option<Box<Expr>>,
     /// `RETURNING`
     pub returning: Vec<ResultColumn>,
-    /// `ORDER BY`
-    pub order_by: Vec<SortedColumn>,
-    /// `LIMIT`
-    pub limit: Option<Limit>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,10 +227,6 @@ pub enum Stmt {
         where_clause: Option<Box<Expr>>,
         /// `RETURNING`
         returning: Vec<ResultColumn>,
-        /// `ORDER BY`
-        order_by: Vec<SortedColumn>,
-        /// `LIMIT`
-        limit: Option<Limit>,
     },
     /// `DETACH DATABASE`: db name
     Detach {
@@ -421,6 +423,11 @@ pub enum FieldAccessResolution {
 }
 
 // https://sqlite.org/syntax/expr.html
+//
+// Large and rare parts, such as subqueries and window definitions, are boxed.
+// Every expression is as large as its largest variant, and the functions that
+// parse, clone, drop, and translate expressions recurse once per level of
+// nesting, holding expressions in their stack frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Expr {
@@ -461,7 +468,7 @@ pub enum Expr {
     /// schema-name.table-name.column-name
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
-    Exists(Select),
+    Exists(Box<Select>),
     /// Struct/union field access (produced by translator, not parser directly)
     FieldAccess {
         /// base expression (e.g., column reference)
@@ -493,6 +500,22 @@ pub enum Expr {
         /// `FILTER`
         filter_over: FunctionTail,
     },
+    /// The value of an unqualified USING column that more than one table can supply.
+    ///
+    /// In `SELECT a FROM t1 FULL JOIN t2 USING(a)`, a row can be missing from
+    /// either table, so `a` is `t1.a` when that is not NULL and `t2.a` otherwise.
+    /// This node holds the source columns in that order: `[t1.a, t2.a]`.
+    ///
+    /// The value is the same as `coalesce(t1.a, t2.a)`, but comparisons treat it
+    /// like the column `t1.a`: it takes the affinity and collation of its first
+    /// column. A user-written `coalesce()` has no affinity and can take its
+    /// collation from any argument. With `t1.a INTEGER` and a row only in `t2`
+    /// whose `a` is the text `'7'`, `a = 7` is true but `coalesce(t1.a, t2.a) = 7`
+    /// is false. SQLite gets the same effect by marking its internal coalesce
+    /// call with `SQLITE_AFF_DEFER`.
+    ///
+    /// The parser never creates this node. Name binding creates it.
+    MergedColumn(Vec<Box<Expr>>),
     /// Identifier
     Id(Name),
     /// Column
@@ -529,7 +552,7 @@ pub enum Expr {
         /// `NOT`
         not: bool,
         /// subquery
-        rhs: Select,
+        rhs: Box<Select>,
     },
     /// `IN` table name / function
     InTable {
@@ -538,7 +561,7 @@ pub enum Expr {
         /// `NOT`
         not: bool,
         /// table name
-        rhs: QualifiedName,
+        rhs: Box<QualifiedName>,
         /// table function arguments
         args: Vec<Box<Expr>>,
     },
@@ -570,7 +593,7 @@ pub enum Expr {
     /// `RAISE` function call
     Raise(ResolveType, Option<Box<Expr>>),
     /// Subquery expression
-    Subquery(Select),
+    Subquery(Box<Select>),
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
@@ -622,6 +645,10 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// True for an explicit `?N` marker. Numbered markers carry no allocated
+    /// name; their "?N" spelling is derived from the index on demand.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub numbered: bool,
 }
 
 impl Variable {
@@ -630,6 +657,17 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            numbered: false,
+        }
+    }
+
+    /// An explicit `?N` marker.
+    pub fn numbered(index: NonZeroU32) -> Self {
+        Self {
+            index,
+            name: None,
+            col_type: None,
+            numbered: true,
         }
     }
 
@@ -642,6 +680,7 @@ impl Variable {
             } else {
                 Some(col_type.into())
             },
+            numbered: false,
         }
     }
 
@@ -650,7 +689,15 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            numbered: false,
         }
+    }
+
+    /// True for positional parameters — a bare `?` or an explicit `?N` —
+    /// and false for named ones (`:x`, `@x`, `$x`). Positional markers
+    /// carry no allocated name.
+    pub fn is_positional(&self) -> bool {
+        self.name.is_none()
     }
 }
 
@@ -666,7 +713,7 @@ pub enum SubqueryType {
         num_regs: usize,
     },
     /// IN subquery; result is stored in an ephemeral index.
-    /// Example: x <NOT> IN (SELECT ...)
+    /// Example: `x <NOT> IN (SELECT ...)`
     In {
         cursor_id: usize,
         /// Affinity string used by the IN operator probe and ephemeral materialization.
@@ -705,7 +752,7 @@ impl Expr {
         Expr::InSelect {
             lhs: Box::new(lhs),
             not,
-            rhs: select,
+            rhs: Box::new(select),
         }
     }
 
@@ -783,6 +830,26 @@ pub enum Literal {
     CurrentTime,
     /// `CURRENT_TIMESTAMP`
     CurrentTimestamp,
+}
+
+pub fn blob_literal_hex(blob: &str) -> &str {
+    debug_assert!(blob.len() >= 3);
+    debug_assert!(matches!(blob.as_bytes()[0], b'x' | b'X'));
+    debug_assert_eq!(blob.as_bytes()[1], b'\'');
+    debug_assert_eq!(blob.as_bytes()[blob.len() - 1], b'\'');
+    &blob[2..blob.len() - 1]
+}
+
+/// Decodes the hex digits of a blob literal such as `X'0102'` into the bytes
+/// they stand for. The parser has already checked that the literal is valid hex.
+pub fn blob_literal_bytes(blob: &str) -> impl Iterator<Item = u8> + '_ {
+    blob_literal_hex(blob)
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
+            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
+        })
 }
 
 /// Textual comparison operator in an expression
@@ -1193,6 +1260,14 @@ impl Name {
             quote: None,
         }
     }
+    /// Create a name parsed from a bracket-quoted identifier (`[name]`),
+    /// remembering the bracket quoting so the name renders back as written.
+    pub const fn bracketed(s: String) -> Self {
+        Self {
+            value: s,
+            quote: Some('['),
+        }
+    }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
     pub fn from_string(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
@@ -1218,7 +1293,7 @@ impl Name {
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);
             assert!(bytes[bytes.len() - 1] == b']');
-            Name::exact(s[1..s.len() - 1].to_string())
+            Name::bracketed(s[1..s.len() - 1].to_string())
         } else {
             Name::exact(s.to_string())
         }
@@ -1238,6 +1313,14 @@ impl Name {
     pub fn as_ident(&self) -> String {
         // let's keep original quotes if they were set
         // (parser.rs tests validates that behaviour)
+        if self.quote == Some('[') {
+            // A `]` cannot be escaped inside a bracket-quoted identifier, so
+            // fall back to double quotes when the name contains one.
+            if !self.value.contains(']') {
+                return format!("[{}]", self.value);
+            }
+            return format!("\"{}\"", self.value.replace('"', "\"\""));
+        }
         if let Some(quote) = self.quote {
             let single = quote.to_string();
             let double = single.clone() + &single;
@@ -1247,7 +1330,12 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
+        let starts_with_digit = value.first().is_some_and(|c| c.is_ascii_digit());
+        if !value.is_empty()
+            && !starts_with_digit
+            && value.iter().all(safe_char)
+            && !is_quotable_keyword(value)
+        {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1256,7 +1344,7 @@ impl Name {
 
     /// Checks if a name represents a quoted string that should get fallback behavior
     /// Need to detect legacy conversion of double quoted keywords to string literals
-    /// (see https://sqlite.org/lang_keywords.html)
+    /// (see <https://sqlite.org/lang_keywords.html>)
     ///
     /// Also, used to detect string literals in PRAGMA cases
     pub fn quoted_with(&self, quote: char) -> bool {
@@ -1472,7 +1560,17 @@ pub enum ColumnConstraint {
     /// `UNIQUE`
     Unique(Option<ResolveType>),
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `DEFAULT`
     Default(Box<Expr>),
     /// `COLLATE`
@@ -1489,6 +1587,8 @@ pub enum ColumnConstraint {
     },
     /// `GENERATED`
     Generated {
+        /// Whether the constraint includes `GENERATED ALWAYS`.
+        generated_always: bool,
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
@@ -1539,7 +1639,17 @@ pub enum TableConstraint {
         conflict_clause: Option<ResolveType>,
     },
     /// `CHECK`
-    Check(Box<Expr>),
+    Check {
+        /// constraint expression
+        expr: Box<Expr>,
+        /// The text between the CHECK parens exactly as the user wrote it,
+        /// whitespace-trimmed. SQLite reports an unnamed failed constraint
+        /// with this text. `None` when the constraint did not come from this
+        /// parser — the PostgreSQL frontend's translator builds these nodes
+        /// from its own AST — or after an ALTER TABLE rewrite changed the
+        /// expression out from under the captured text.
+        source: Option<String>,
+    },
     /// `FOREIGN KEY`
     ForeignKey {
         /// columns
@@ -1607,13 +1717,29 @@ pub enum SortOrder {
 }
 
 /// `NULLS FIRST` or `NULLS LAST`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NullsOrder {
     /// `NULLS FIRST`
     First,
     /// `NULLS LAST`
     Last,
+}
+
+impl NullsOrder {
+    pub fn reverse(&self) -> Self {
+        match self {
+            NullsOrder::First => NullsOrder::Last,
+            NullsOrder::Last => NullsOrder::First,
+        }
+    }
+
+    pub fn default_for(order: SortOrder) -> Self {
+        match order {
+            SortOrder::Asc => NullsOrder::First,
+            SortOrder::Desc => NullsOrder::Last,
+        }
+    }
 }
 
 /// `REFERENCES` clause
@@ -1772,12 +1898,15 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
-    /// set the busy_timeout (see https://www.sqlite.org/pragma.html#pragma_busy_timeout)
+    /// set the busy_timeout (see <https://www.sqlite.org/pragma.html#pragma_busy_timeout>)
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
     /// set the cache spill behavior
     CacheSpill,
+    /// When ON, each INSERT, UPDATE and DELETE returns one row with the
+    /// number of rows it changed.
+    CountChanges,
     /// encryption cipher algorithm name for encrypted databases
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]
@@ -1832,7 +1961,7 @@ pub enum PragmaName {
     SchemaVersion,
     /// Deprecated: control whether unaliased column names omit the table name prefix
     ShortColumnNames,
-    /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
+    /// Alias for `require_where` pragma, as an homage to MySQL (<https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates>)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
     RequireWhere,
@@ -1863,6 +1992,8 @@ pub enum PragmaName {
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,
+    /// Sets or queries the number of WAL frames after which a commit runs an automatic checkpoint.
+    WalAutocheckpoint,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
@@ -1871,6 +2002,13 @@ pub enum PragmaName {
     /// last GC pass) at which MVCC runs an inline, non-blocking garbage
     /// collection pass on the commit path. -1 disables inline GC.
     MvccGcThreshold,
+    /// Sets or queries whether concurrent MVCC commits batch their logical-log
+    /// appends behind a single fsync.
+    MvccGroupCommit,
+    /// Sets or queries the number of visible FTS index segments a statement
+    /// flush may leave behind before the write path merges them. 0 disables
+    /// write-path merging.
+    FtsMergeThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets
@@ -2118,8 +2256,9 @@ pub enum UpsertDo {
 pub struct FunctionTail {
     /// `FILTER` clause
     pub filter_clause: Option<Box<Expr>>,
-    /// `OVER` clause
-    pub over_clause: Option<Over>,
+    /// `OVER` clause. Boxed because it is large and rare: stored inline, it
+    /// would make every [Expr] as large as a window definition.
+    pub over_clause: Option<Box<Over>>,
 }
 
 /// Function call `OVER` clause

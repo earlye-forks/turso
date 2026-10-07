@@ -45,7 +45,6 @@ impl IO for VfsMod {
         Ok(())
     }
 
-    /// The C-ABI VFS extension interface has no slot for a directory sync.
     fn sync_parent_dir(&self, _path: &str, _c: Completion) -> Result<Completion> {
         Err(LimboError::IoExtensionUnsupported("sync_parent_dir"))
     }

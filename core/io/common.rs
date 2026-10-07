@@ -1,23 +1,12 @@
 pub const ENV_DISABLE_FILE_LOCK: &str = "LIMBO_DISABLE_FILE_LOCK";
 
-/// Returns the parent directory of `path`. The parent of a bare filename is
-/// the current directory.
 #[cfg(unix)]
-fn parent_dir(path: &str) -> &std::path::Path {
-    std::path::Path::new(path)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
-}
-
-/// Fsync the parent directory of `path` so that its directory entry is
-/// durable. Shared by the POSIX `IO::sync_parent_dir` impls.
-#[cfg(unix)]
-pub(crate) fn fsync_parent_dir(path: &str) -> crate::Result<()> {
-    let dir = std::fs::File::open(parent_dir(path))
-        .map_err(|e| crate::error::io_error(e, "open parent dir"))?;
-    dir.sync_all()
-        .map_err(|e| crate::error::io_error(e, "sync parent dir"))
+pub(crate) fn fsync_parent_dir(path: &str) -> std::io::Result<()> {
+    let parent = match std::path::Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]
@@ -38,10 +27,19 @@ pub mod tests {
 
         let current_exe = std::env::current_exe().expect("Failed to get current executable path");
 
+        // The child runs the whole test binary and then leaves through
+        // `process::exit`, so its destructors never run and any temp file
+        // another test had in flight is orphaned. Point it at a directory we
+        // own so those files disappear with it.
+        let child_temp_dir = tempfile::tempdir().expect("Failed to create child temp dir");
+
         // Spawn a child process and try to open the same file
         let child = Command::new(current_exe)
             .env("RUST_TEST_CHILD_PROCESS", "1")
             .env("RUST_TEST_FILE_PATH", &path)
+            .env("TMPDIR", child_temp_dir.path())
+            .env("TMP", child_temp_dir.path())
+            .env("TEMP", child_temp_dir.path())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

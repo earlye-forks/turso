@@ -14,6 +14,7 @@ use pyo3::{
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
+pub use turso_sdk_kit::IoBackend;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -136,7 +137,7 @@ pub struct PyTursoDatabaseConfig {
     /// - "memory": in-memory backend
     /// - "syscall": generic syscall backend
     /// - "io_uring": IO uring (supported only on Linux)
-    pub vfs: Option<String>,
+    pub vfs: IoBackend,
 
     /// optional encryption parameters
     /// as encryption is experimental - experimental_features must have "encryption" in the list
@@ -156,7 +157,7 @@ impl PyTursoDatabaseConfig {
         Self {
             path,
             experimental_features,
-            vfs,
+            vfs: vfs.map_or(IoBackend::Default, IoBackend::from),
             encryption: encryption.cloned(),
         }
     }
@@ -210,6 +211,8 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         vfs: config.vfs.clone(),
         io: None,
         db_file: None,
+        page_codec: None,
+        open_flags: Default::default(),
     });
     let result = database.open().map_err(turso_error_to_py_err)?;
     // async_io is false - so db.open() will return result immediately
@@ -258,6 +261,10 @@ impl PyTursoConnection {
     /// Get the auto_commmit mode for the connection
     pub fn get_auto_commit(&self) -> PyResult<bool> {
         Ok(self.connection.get_auto_commit())
+    }
+    /// Rowid of the most recent successful INSERT on this connection.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.connection.last_insert_rowid()
     }
     /// Request interruption of the statement currently executing on this connection.
     pub fn interrupt(&self) {

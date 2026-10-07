@@ -5,10 +5,11 @@ use crate::{
         Command, CommandParser,
     },
     config::Config,
+    dot_command::tokenize_dot_command,
     helper::LimboHelper,
     input::{
-        get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
-        Settings, StderrProgress,
+        get_io, get_writer, open_flags, ApplyWriter, DbLocation, NoopProgress, OutputMode,
+        ProgressSink, Settings, StderrProgress,
     },
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
@@ -35,7 +36,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    io_error, Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, Statement, Value,
+    io_error, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags, QueryMode,
+    SqliteDialect, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -83,6 +85,20 @@ pub struct Opts {
         help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
     )]
     pub sync_server: Option<String>,
+    #[clap(
+        long,
+        requires = "sync_server",
+        conflicts_with = "database",
+        help = "Serve every database under PATH over the sync server, addressed as /db/{name}"
+    )]
+    pub sync_dir: Option<PathBuf>,
+    #[clap(
+        long,
+        requires = "sync_dir",
+        default_value_t = 256,
+        help = "Most databases held open at once under --sync-dir, one connection each; more may exist on disk"
+    )]
+    pub sync_max_databases: usize,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -127,7 +143,7 @@ pub struct Limbo {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
-    db_opts: turso_core::DatabaseOpts,
+    pub(crate) db_opts: turso_core::DatabaseOpts,
     read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
@@ -256,19 +272,16 @@ impl Limbo {
         let db_file = normalize_db_path(db_file);
 
         let (io, conn) = if db_file.starts_with("file:") {
-            Connection::from_uri(&db_file, db_opts)?
+            Connection::from_uri(&db_file, db_opts, Arc::new(SqliteDialect))?
         } else {
-            let flags = if opts.readonly {
-                OpenFlags::default().union(OpenFlags::ReadOnly)
-            } else {
-                OpenFlags::default()
-            };
+            let flags = open_flags(opts.readonly);
             let (io, db) = Database::open_new(
                 &db_file,
                 opts.vfs.as_ref(),
                 flags,
                 db_opts.turso_cli(),
                 None,
+                Arc::new(SqliteDialect),
             )?;
             let conn = db.connect()?;
             (io, conn)
@@ -468,7 +481,8 @@ impl Limbo {
     fn open_db(&mut self, path: &str, vfs_name: Option<&str>) -> anyhow::Result<()> {
         self.conn.close()?;
         let (io, db) = if let Some(vfs_name) = vfs_name {
-            self.conn.open_new(path, vfs_name)?
+            self.conn
+                .open_new(path, vfs_name, Arc::new(SqliteDialect))?
         } else {
             let io = {
                 match path {
@@ -484,6 +498,7 @@ impl Limbo {
                     OpenFlags::default(),
                     self.db_opts,
                     None,
+                    Arc::new(SqliteDialect),
                 )?,
             )
         };
@@ -782,24 +797,15 @@ impl Limbo {
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
-        let first = line.split_whitespace().next();
-        let parse = match first {
-            Some("parameter") | Some("param") => {
-                let args = shlex::split(line).unwrap_or_else(|| {
-                    line.split_whitespace()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>()
-                });
-                if args.is_empty() {
-                    return;
-                }
-                CommandParser::try_parse_from(args)
-            }
-            _ => {
-                let args = line.split_whitespace();
-                CommandParser::try_parse_from(args)
-            }
-        };
+        let (args, unterminated_quote) = tokenize_dot_command(line);
+        if let Some(quote) = unterminated_quote {
+            let _ = self.writeln_fmt(format_args!("unterminated {quote} quote"));
+            return;
+        }
+        if args.is_empty() {
+            return;
+        }
+        let parse = CommandParser::try_parse_from(args);
         match parse {
             Err(err) => {
                 // Let clap print with Styled Colors instead
@@ -983,8 +989,21 @@ impl Limbo {
                     (OutputMode::List, _) => {
                         self.print_list_mode(rows, statistics)?;
                     }
-                    (_, QueryMode::ExplainQueryPlan) => {
+                    (
+                        _,
+                        QueryMode::ExplainQueryPlan {
+                            format: EqpFormat::Text,
+                        },
+                    ) => {
                         self.print_explain_query_plan(rows, statistics)?;
+                    }
+                    (
+                        _,
+                        QueryMode::ExplainQueryPlan {
+                            format: EqpFormat::Json,
+                        },
+                    ) => {
+                        self.print_list_mode(rows, statistics)?;
                     }
                     (_, QueryMode::Explain) => {
                         self.print_explain(rows, statistics)?;
@@ -1205,10 +1224,19 @@ impl Limbo {
                         if i > 0 {
                             let _ = self.write(b"|");
                         }
-                        if matches!(value, Value::Null) {
-                            let _ = self.write(null_value.as_bytes());
-                        } else {
-                            write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
+                        match value {
+                            Value::Null => {
+                                let _ = self.write(null_value.as_bytes());
+                            }
+                            // Write blob bytes raw, like sqlite3 does in list
+                            // mode. Going through Display would replace bytes
+                            // that are not valid UTF-8 with U+FFFD.
+                            Value::Blob(bytes) => {
+                                self.write(bytes).map_err(|e| io_error(e, "write"))?;
+                            }
+                            _ => {
+                                write!(self, "{value}").map_err(|e| io_error(e, "write"))?;
+                            }
                         }
                     }
                     let _ = self.writeln("");
@@ -1265,7 +1293,6 @@ impl Limbo {
             match stepper.next_row() {
                 Ok(Some(row)) => {
                     let mut table_row = Row::new();
-                    table_row.max_height(1);
                     for (idx, value) in row.get_values().enumerate() {
                         let (content, alignment) = match value {
                             Value::Null => (null_value.clone(), CellAlignment::Left),
@@ -1355,7 +1382,16 @@ impl Limbo {
                 let _ = self.writeln("database is busy");
             }
             _ => {
-                let _ = self.writeln_fmt(format_args!("Error: {err}"));
+                // Mirror the sqlite3 shell: the bare sqlite3_errmsg text plus
+                // the result code, e.g.
+                // "Runtime error: UNIQUE constraint failed: t.a (19)".
+                // The shell omits the code for plain SQLITE_ERROR (1).
+                let code = err.sqlite_result_code();
+                if code == 1 {
+                    let _ = self.writeln_fmt(format_args!("Runtime error: {err}"));
+                } else {
+                    let _ = self.writeln_fmt(format_args!("Runtime error: {err} ({code})"));
+                }
             }
         }
     }
@@ -1818,8 +1854,13 @@ impl Limbo {
         if let Some(mut rows) = conn.query(q_tables)? {
             rows.run_with_row_callback(|row| {
                 let name: &str = row.get::<&str>(0)?;
-                // Skip sqlite_sequence and internal types metadata table
-                if name == "sqlite_sequence" || name == turso_core::schema::TURSO_TYPES_TABLE_NAME {
+                // Skip sqlite_sequence and every internal object. Index-method
+                // backing tables (e.g. FTS's __turso_internal_fts_dir_*) are
+                // rejected on replay because their names are reserved, and the
+                // trailing CREATE INDEX ... USING ... rebuilds them anyway.
+                if name == "sqlite_sequence"
+                    || name.starts_with(turso_core::schema::TURSO_INTERNAL_PREFIX)
+                {
                     return Ok(());
                 }
                 let ddl: &str = row.get::<&str>(1)?;
@@ -1965,6 +2006,7 @@ impl Limbo {
             SELECT name, sql FROM sqlite_schema
             WHERE sql NOT NULL
               AND name NOT LIKE 'sqlite_%'
+              AND name NOT LIKE '\_\_turso\_internal\_%' ESCAPE '\'
               AND type IN ('index','trigger','view')
             ORDER BY CASE type WHEN 'view' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 END, rowid
         "#;
@@ -2028,7 +2070,7 @@ impl Limbo {
             anyhow::bail!("Refusing to overwrite existing file: {output_file}");
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file)?;
+        let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
         let target = db.connect()?;
 
         let mut applier = ApplyWriter::new(&target);
