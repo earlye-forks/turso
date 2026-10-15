@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    if: github.repository == 'tursodatabase/turso'
     uses: ./.github/workflows/antithesis.yml
     with:
       duration: ${{ github.event.schedule == '0 0 * * 6' && 1440 || 240 }}

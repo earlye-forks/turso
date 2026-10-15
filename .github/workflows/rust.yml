@@ -16,13 +16,13 @@ env:
   CARGO_NET_RETRY: 10
   # Capture stack traces when a test panics so CI failure reports are actionable.
   RUST_BACKTRACE: 1
-  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # Some Windows runner images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   license-check:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
       - run: cargo deny check licenses
 
   cargo-fmt-check:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
         run: cd fuzz && cargo fmt --check
 
   check-bindings:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -60,19 +60,22 @@ jobs:
           fi
 
   build-native:
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       matrix:
         os:
           [
-            blacksmith-4vcpu-ubuntu-2404,
-            blacksmith-6vcpu-macos-latest,
-            blacksmith-8vcpu-windows-2025,
+            ubuntu-24.04,
+            macos-latest,
+            windows-2025,
           ]
 
     runs-on: ${{ matrix.os }}
 
     steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -92,7 +95,7 @@ jobs:
       - name: Install cargo-llvm-cov
         if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: taiki-e/install-action@cargo-llvm-cov
-      # Blacksmith Windows images ship no LLVM; the all-features build pulls in
+      # Some Windows runner images ship no LLVM; the all-features build pulls in
       # pg_query, whose bindgen needs libclang.dll.
       - name: Install LLVM (libclang for bindgen)
         if: runner.os == 'Windows'
@@ -100,7 +103,7 @@ jobs:
           choco install llvm -y --no-progress
           echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
       - name: Set up Python 3.10
-        uses: useblacksmith/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - name: Install SQLite (Windows)
@@ -160,7 +163,7 @@ jobs:
   # before integrity_check's structural validation ever runs. The tests
   # exercise platform-independent core logic, so one Linux runner suffices.
   integrity-corruption-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -178,7 +181,7 @@ jobs:
         timeout-minutes: 5
 
   build-windows-arm64-cli:
-    # Stays on GitHub-hosted: Blacksmith Windows images lack the MSVC ARM64
+    # Uses windows-2025: some Windows runner images lack the MSVC ARM64
     # cross tools (Microsoft.VisualStudio.Component.VC.Tools.ARM64).
     runs-on: windows-2025
     timeout-minutes: 60
@@ -210,7 +213,7 @@ jobs:
           }
 
   build-wasm32-unknown-unknown:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -225,7 +228,7 @@ jobs:
         run: cargo check -p turso --target wasm32-unknown-unknown --locked
 
   shuttle-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -243,7 +246,7 @@ jobs:
           make test-shuttle
 
   conn-raw-api-tests:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -260,7 +263,7 @@ jobs:
         run: cargo nextest run -p turso_core --features conn_raw_api --locked --no-fail-fast --failure-output=final
 
   # stress-nondeterminism-check:
-  #   runs-on: blacksmith-4vcpu-ubuntu-2404
+  #   runs-on: ubuntu-24.04
   #   timeout-minutes: 15
   #   steps:
   #     - uses: actions/checkout@v4
@@ -278,9 +281,11 @@ jobs:
   #         cargo run -p turso_stress -- --check-uncontrolled-nondeterminism
 
   clippy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -294,7 +299,7 @@ jobs:
           cargo clippy --workspace --all-features --all-targets --locked --exclude memory-benchmark -- --deny=warnings
 
   simulator:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     strategy:
       matrix:
@@ -401,7 +406,7 @@ jobs:
   # on pushes to main (differential-fuzzer-random below), where a failure is a
   # signal to investigate rather than a gate on an unrelated change.
   differential-fuzzer:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
@@ -447,7 +452,7 @@ jobs:
   # without blocking an unrelated pull request.
   differential-fuzzer-random:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS: 180
@@ -490,7 +495,7 @@ jobs:
           done
 
   test-limbo:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -503,7 +508,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install uv
-        uses: useblacksmith/setup-uv@v4
+        uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
 
@@ -516,7 +521,7 @@ jobs:
 
   concurrent-simulator:
     name: "Concurrent simulator (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -606,7 +611,7 @@ jobs:
           ' _
 
   concurrent-simulator-windows:
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -642,7 +647,7 @@ jobs:
         run: cargo run -q -p turso_whopper -- --mode fast --multiprocess --connections-per-process 4 --processes 4 --kill-probability 0.01 --max-steps 10000
 
   test-sqlite:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

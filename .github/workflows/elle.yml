@@ -31,7 +31,7 @@ env:
 jobs:
   elle-check:
     name: Elle ${{ matrix.elle_model }} (${{ matrix.mode }})
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: useblacksmith/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
 

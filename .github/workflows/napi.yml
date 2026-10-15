@@ -15,7 +15,7 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "10.13"
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
-  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # Some Windows runner images ship VS Build Tools without LLVM, so the aegis
   # crate's clang-cl preference fails; force the MSVC compiler instead.
   CC_x86_64_pc_windows_msvc: cl.exe
 
@@ -29,16 +29,16 @@ concurrency:
 
 jobs:
   build:
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         settings:
-          - host: blacksmith-4vcpu-windows-2025
+          - host: windows-2025
             target: x86_64-pc-windows-msvc
             artifact: db-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/database napi-build --target x86_64-pc-windows-msvc
-          - host: blacksmith-4vcpu-windows-2025
+          - host: windows-2025
             target: x86_64-pc-windows-msvc
             artifact: sync-bindings-x86_64-pc-windows-msvc
             build: yarn workspace @tursodatabase/sync napi-build --target x86_64-pc-windows-msvc
@@ -52,19 +52,19 @@ jobs:
             artifact: sync-bindings-x86_64-unknown-linux-gnu
             docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: yarn workspace @tursodatabase/sync napi-build --target x86_64-unknown-linux-gnu
-          - host: blacksmith-6vcpu-macos-latest
+          - host: macos-latest
             target: aarch64-apple-darwin
             artifact: db-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-apple-darwin
-          - host: blacksmith-6vcpu-macos-latest
+          - host: macos-latest
             target: aarch64-apple-darwin
             artifact: sync-bindings-aarch64-apple-darwin
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-apple-darwin
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+          - host: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: db-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-gnu
-          - host: blacksmith-2vcpu-ubuntu-2404-arm
+          - host: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             artifact: sync-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
@@ -199,11 +199,11 @@ jobs:
         node:
           - "22"
           - "24"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: useblacksmith/setup-node@v5
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       - name: Install dependencies
@@ -232,7 +232,7 @@ jobs:
         node:
           - "22"
           - "24"
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
@@ -260,7 +260,7 @@ jobs:
     timeout-minutes: 30
     needs:
       - build
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
     container:
@@ -299,11 +299,11 @@ jobs:
         node:
           - "22"
           - "24"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
-        uses: useblacksmith/setup-node@v5
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
       - name: Setup Rust toolchain
@@ -354,7 +354,7 @@ jobs:
         node:
           - "22"
           - "24"
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
@@ -404,7 +404,7 @@ jobs:
     timeout-minutes: 30
     needs:
       - build
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     # Image ships node 20 + chromium + firefox + system deps. Bump the tag
     # whenever the `playwright` dep in bindings/javascript/yarn.lock changes.
     container:
@@ -457,6 +457,7 @@ jobs:
           LOCAL_SYNC_SERVER: ${{ github.workspace }}/target/debug/tursodb
         run: yarn workspace @tursodatabase/sync-wasm test
   publish:
+    if: github.repository == 'tursodatabase/turso'
     name: Publish
     runs-on: ubuntu-latest
     timeout-minutes: 30

@@ -22,6 +22,7 @@ env:
 
 jobs:
   memory:
+    if: github.repository == 'tursodatabase/turso'
     name: Memory benchmarks
     uses: ./.github/workflows/codspeed-memory.yml
     permissions:
@@ -29,8 +30,9 @@ jobs:
       id-token: write
 
   discover:
+    if: github.repository == 'tursodatabase/turso'
     name: Discover benchmark shards
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       benchmarks: ${{ steps.benchmarks.outputs.benchmarks }}
@@ -61,8 +63,9 @@ jobs:
           echo "benchmarks=$json" >> "$GITHUB_OUTPUT"
 
   build-stable:
+    if: github.repository == 'tursodatabase/turso'
     name: "Build benchmarks (stable)"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
@@ -130,8 +133,8 @@ jobs:
 
   build-nightly:
     name: "Build benchmarks (nightly)"
-    if: github.event_name != 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.repository == 'tursodatabase/turso' && (github.event_name != 'pull_request')
+    runs-on: ubuntu-24.04
     needs: discover
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
@@ -199,11 +202,11 @@ jobs:
 
   benchmarks-stable:
     name: "Run benchmark (stable, ${{ matrix.benchmark }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - discover
       - build-stable
-    if: needs.build-stable.outputs.built == 'true'
+    if: github.repository == 'tursodatabase/turso' && (needs.build-stable.outputs.built == 'true')
     timeout-minutes: 30
     # Allow this job to fail without failing the entire CI run
     continue-on-error: true
@@ -254,11 +257,11 @@ jobs:
 
   benchmarks-nightly:
     name: "Run benchmark (nightly, ${{ matrix.benchmark }})"
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     needs:
       - discover
       - build-nightly
-    if: needs.build-nightly.outputs.built == 'true'
+    if: github.repository == 'tursodatabase/turso' && (needs.build-nightly.outputs.built == 'true')
     timeout-minutes: 30
     # Allow this job to fail without failing the entire CI run
     continue-on-error: true

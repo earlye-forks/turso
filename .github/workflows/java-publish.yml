@@ -17,11 +17,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             make-target: linux_x86
             artifact-name: linux-x86_64
-          - os: blacksmith-6vcpu-macos-latest
+          - os: macos-latest
             target: x86_64-apple-darwin
             make-target: macos_x86
             artifact-name: macos-x86_64
-          - os: blacksmith-6vcpu-macos-latest
+          - os: macos-latest
             target: aarch64-apple-darwin
             make-target: macos_arm64
             artifact-name: macos-arm64
@@ -31,7 +31,7 @@ jobs:
             artifact-name: windows-x86_64
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     defaults:
       run:
@@ -79,6 +79,7 @@ jobs:
 
   # Publish to Maven Central with all native libraries
   publish:
+    if: github.repository == 'tursodatabase/turso'
     needs: build-natives
     runs-on: ubuntu-latest
     timeout-minutes: 30

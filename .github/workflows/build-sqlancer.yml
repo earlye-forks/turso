@@ -29,7 +29,8 @@ env:
 
 jobs:
   deploy:
-    runs-on: blacksmith
+    if: github.repository == 'tursodatabase/turso'
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout code

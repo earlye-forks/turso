@@ -20,6 +20,7 @@ env:
 
 jobs:
   bench:
+    if: github.repository == 'tursodatabase/turso'
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     # Nyrkiö runners kill a job after 92 minutes. scripts/nightly-bench.sh
     # stops running benchmarks before that, so that the results so far still
@@ -29,7 +30,7 @@ jobs:
       DISABLE_RUSQLITE_BENCHMARK: 1
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/setup-node@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
       #     cache: 'npm'
@@ -168,11 +169,12 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   clickbench:
+    if: github.repository == 'tursodatabase/turso'
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: useblacksmith/setup-node@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
 
@@ -222,6 +224,7 @@ jobs:
           nyrkio-settings-threshold: 0%
 
   tpc-h-criterion:
+    if: github.repository == 'tursodatabase/turso'
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
     timeout-minutes: 60
     env:
@@ -235,7 +238,7 @@ jobs:
 
       - name: Cache TPC-H
         id: cache-primes
-        uses: useblacksmith/cache@v5
+        uses: actions/cache@v4
         with:
           path: ${{ env.DB_FILE }}
           key: tpc-h

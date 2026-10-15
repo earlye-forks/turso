@@ -1,7 +1,7 @@
 name: Setup Rust toolchain (cached)
 description: >
   Install a pinned Rust toolchain, restoring the rustup installation from the
-  Actions cache when possible. The Blacksmith runner images ship without
+  Actions cache when possible. Some runner images ship without
   rustup, so without this cache every job downloads rustup from sh.rustup.rs
   and the toolchain from static.rust-lang.org, and transient network failures
   fail the job. With the cache, those hosts are only contacted when the pinned

@@ -62,7 +62,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - uses: useblacksmith/setup-node@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
 
@@ -84,7 +84,7 @@ jobs:
 
       - name: Cache TPC-H
         id: cache-primes
-        uses: useblacksmith/cache@v5
+        uses: actions/cache@v4
         with:
           path: ${{ env.DB_FILE }}
           key: tpc-h
@@ -127,7 +127,7 @@ jobs:
         run: cargo build --release --verbose --locked
 
       - name: Install uv
-        uses: useblacksmith/setup-uv@v4
+        uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
 

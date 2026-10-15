@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   stale:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.repository == 'tursodatabase/turso'
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Close stale pull requests
