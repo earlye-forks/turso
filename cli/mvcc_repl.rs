@@ -37,7 +37,7 @@
 use anyhow::Context as _;
 use rustyline::DefaultEditor;
 use std::{collections::HashMap, sync::Arc};
-use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Value};
+use turso_core::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, SqliteDialect, Value};
 
 pub fn run(path: &str, passive_checkpoint: bool) -> anyhow::Result<()> {
     let interactive_stdin = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -95,8 +95,11 @@ fn open_mvcc_db(path: &str, passive_checkpoint: bool) -> anyhow::Result<Arc<Data
         path,
         None,
         OpenFlags::default(),
-        DatabaseOpts::default().with_experimental_mvcc_passive_checkpoint(passive_checkpoint),
+        DatabaseOpts::default()
+            .with_experimental_mvcc_passive_checkpoint(passive_checkpoint)
+            .with_index_method(true),
         None,
+        Arc::new(SqliteDialect),
     )
     .context("failed to open database")?;
 

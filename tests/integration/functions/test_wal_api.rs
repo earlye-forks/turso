@@ -1,4 +1,5 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use turso_core::SqliteDialect;
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -61,6 +62,41 @@ fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
     let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
     assert_eq!(rows, vec![(5, 1), (10, 2), (1024, 40960)]);
+}
+
+#[test]
+fn test_wal_frame_transfer_reserved_bytes() {
+    let source = TempDatabase::new_empty();
+    let writer = source.connect_limbo();
+    writer.set_reserved_bytes(8).unwrap();
+    writer.execute("CREATE TABLE t(y BLOB)").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (zeroblob(4050)), (zeroblob(4056))")
+        .unwrap();
+    let expected = vec![(4050,), (4056,)];
+    let rows: Vec<(i64,)> = writer.exec_rows("SELECT length(y) FROM t");
+    assert_eq!(rows, expected);
+
+    let target = TempDatabase::new_empty();
+    let importer = target.connect_limbo();
+    importer.get_pager().reset_checksum_context();
+    importer.set_reserved_bytes(0).unwrap();
+    importer.execute("BEGIN IMMEDIATE").unwrap();
+    importer.execute("COMMIT").unwrap();
+    let reader = target.connect_limbo();
+    let mut frame = [0; 24 + 4096];
+    importer.wal_insert_begin().unwrap();
+    for frame_id in 1..=writer.wal_state().unwrap().max_frame {
+        writer.wal_get_frame(frame_id, &mut frame).unwrap();
+        importer.wal_insert_frame(frame_id, &frame).unwrap();
+    }
+    assert_eq!(importer.get_reserved_bytes(), Some(8));
+    importer.wal_insert_end(false).unwrap();
+
+    for conn in [reader, importer, target.connect_limbo()] {
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT length(y) FROM t");
+        assert_eq!(rows, expected);
+    }
 }
 
 // TODO: mvcc
@@ -855,23 +891,21 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
 // TODO: see later how this test should work with mvcc
 #[test]
 fn test_db_share_same_file() {
-    let mut path = TempDir::new().unwrap().keep();
+    let temp_dir = TempDir::new().unwrap();
     let (mut rng, _) = rng_from_time();
-    path.push(format!("test-{}.db", rng.next_u32()));
+    let path = temp_dir.path().join(format!("test-{}.db", rng.next_u32()));
 
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
     let db_file = io
         .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
         .unwrap();
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(db_file));
-    let db1 = turso_core::Database::open_with_flags(
+    let db1 = turso_core::Database::open(
         io.clone(),
         path.to_str().unwrap(),
-        db_file.clone(),
-        turso_core::OpenFlags::Create,
-        turso_core::DatabaseOpts::new(),
-        None,
-        None,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .flags(turso_core::OpenFlags::Create),
     )
     .unwrap();
     let conn1 = db1.connect().unwrap();
@@ -891,14 +925,12 @@ fn test_db_share_same_file() {
         .execute("insert into a values (2, randomblob(2 * 4096))")
         .unwrap();
 
-    let db2 = turso_core::Database::open_with_flags_bypass_registry(
+    let db2 = turso_core::Database::do_open(
         io.clone(),
         path.to_str().unwrap(),
-        &format!("{}-wal-copy", path.to_str().unwrap()),
-        db_file.clone(),
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new(),
-        None,
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(db_file.clone())
+            .wal_path(format!("{}-wal-copy", path.to_str().unwrap())),
     )
     .unwrap();
     let conn2 = db2.connect().unwrap();
@@ -977,4 +1009,29 @@ fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
             ))
             .unwrap();
     }
+}
+
+#[turso_macros::test()]
+fn test_wal_watermark_read_page_out_of_range_returns_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i})"))
+            .unwrap();
+    }
+    let max_frame = conn.wal_state().unwrap().max_frame;
+    assert!(max_frame > 1);
+    let mut page = vec![0u8; 4096];
+
+    let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame + 1));
+    assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+
+    conn.checkpoint(CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+
+    let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame - 1));
+    assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
 }

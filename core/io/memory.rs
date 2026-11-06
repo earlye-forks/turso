@@ -87,7 +87,6 @@ impl IO for MemoryIO {
         Ok(())
     }
 
-    /// Nothing in memory survives a crash, so there is nothing to make durable.
     fn sync_parent_dir(&self, _path: &str, c: Completion) -> Result<Completion> {
         c.complete(0);
         Ok(c)

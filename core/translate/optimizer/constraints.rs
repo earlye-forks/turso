@@ -1,18 +1,25 @@
+use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
+use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
-            as_binary_components, comparison_affinity, get_expr_affinity, unwrap_parens,
+            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
             walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
-        plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
+        plan::{
+            is_non_null_literal, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
+            NonFromClauseSubquery, Plan, SubqueryState, TableReferences, WhereTerm,
+            WhereTermOrigin,
+        },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
             TableMask, ROWID_STRS,
         },
+        Resolver,
     },
     util::exprs_are_equivalent,
     vdbe::affinity::Affinity,
@@ -20,11 +27,9 @@ use crate::{
 };
 use crate::{turso_assert, turso_debug_assert};
 use smallvec::SmallVec;
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
-
-use super::{cost_params::CostModelParams, AvailableIndexes};
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -74,6 +79,11 @@ pub struct Constraint {
     /// False for IN constraints (which use a separate multi-value seek path)
     /// and for collation mismatches.
     pub usable: bool,
+    /// Whether this term can constrain the table before an outer join adds NULL rows.
+    ///
+    /// For `a LEFT JOIN b ON true WHERE b.x IS NULL`, this is false.
+    /// The join must test `b.x IS NULL` after it creates the NULL row.
+    pub outer_join_compatible: bool,
     /// Whether this constraint references the implicit rowid (tables without an INTEGER PRIMARY KEY alias).
     /// When true and `table_col_pos` is None, this constraint targets the rowid pseudo-column.
     pub is_rowid: bool,
@@ -89,6 +99,14 @@ pub struct Constraint {
     /// not yet plumb per-column affinity into the index-selection path, so
     /// such constraints fall through to scans).
     pub comparison_affinity: Option<Affinity>,
+    /// Whether this constraint's seek key can be NULL and still match rows.
+    /// True only for `IS` whose constraining value is not known to be
+    /// non-NULL. `a IS 5` gets false: a literal 5 is never NULL, so the
+    /// constraint filters exactly like `a = 5`. `a IS NULL`, `a IS ?` and
+    /// `a IS other.col` get true — an index (even a UNIQUE one) can store
+    /// many NULL keys, so such a constraint can match many rows and its cost
+    /// and row estimates must not be taken from equality statistics.
+    pub null_matching: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,6 +143,7 @@ impl Constraint {
         &self,
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
+        resolver: Option<&Resolver>,
     ) -> (ast::Operator, ast::Expr, Affinity) {
         // For multi-index branches, use the pre-computed constraining expression
         if let Some(constraining) = &self.constraining_expr {
@@ -138,7 +157,11 @@ impl Constraint {
         };
         let mut affinity = Affinity::Blob;
         if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, None);
+            // The resolver matters here: a scalar subquery's affinity is only
+            // known through it. Without it, `text_col < (SELECT int_col ...)`
+            // would take the TEXT side's affinity and the seek would compare
+            // the integer as text.
+            affinity = comparison_affinity(lhs, rhs, referenced_tables, resolver);
         }
 
         if side == BinaryExprSide::Lhs {
@@ -192,11 +215,8 @@ impl Constraint {
     }
 
     /// Whether this constraint can drive an index seek on its target column.
-    /// Composes the `usable`/`table_col_pos` gates with the affinity check
-    /// against the column at `table_col_pos` in `columns` (set `is_strict`
-    /// only for STRICT tables; subqueries pass `false`).
-    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
-        if !self.usable {
+    pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
+        if !self.usable || !self.outer_join_compatible {
             return false;
         }
         let Some(pos) = self.table_col_pos else {
@@ -205,7 +225,7 @@ impl Constraint {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
+        self.satisfies_index_affinity(col.affinity())
     }
 }
 
@@ -220,6 +240,8 @@ pub struct ConstraintRef {
     pub index_col_pos: usize,
     /// The sort order of the constrained column in the index. Always ascending for rowid indices.
     pub sort_order: SortOrder,
+    /// Where the constrained index column stores NULLs in its forward layout.
+    pub nulls_order: ast::NullsOrder,
 }
 
 /// A collection of [ConstraintRef]s for a given index, or if index is None, for the table's rowid index.
@@ -264,6 +286,60 @@ pub struct TableConstraints {
     pub constraints: Vec<Constraint>,
     /// Candidates for indexes that may use the constraints to perform a lookup.
     pub candidates: Vec<ConstraintUseCandidate>,
+    /// Conditions that a temporary index may use for a lookup.
+    pub temporary_index_terms: SmallVec<[ConstraintRef; 4]>,
+}
+
+/// Build the search terms for an automatic index.
+///
+/// Terms for the same table column use the same index column.
+pub(super) fn automatic_index_terms(
+    table: &JoinedTable,
+    constraints: &TableConstraints,
+) -> SmallVec<[ConstraintRef; 4]> {
+    let columns = table.columns();
+    let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
+        .constraints
+        .iter()
+        .filter(|term| term.can_drive_index_seek(columns))
+        .collect();
+    let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
+
+    let mut terms: SmallVec<[ConstraintRef; 4]> = constraints
+        .constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter_map(|(term_index, term)| {
+            let table_col_pos = term.table_col_pos?;
+            Some(ConstraintRef {
+                constraint_vec_pos: term_index,
+                index_col_pos: index_columns
+                    .iter()
+                    .position(|column| *column == table_col_pos)?,
+                sort_order: SortOrder::Asc,
+                nulls_order: ast::NullsOrder::First,
+            })
+        })
+        .collect();
+    terms.sort_by_key(|term| term.index_col_pos);
+    terms
+}
+
+/// Return true when an expression names a custom text order.
+pub(super) fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
+    let mut uses_custom = false;
+    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        if let ast::Expr::Collate(_, collation_name) = expr {
+            uses_custom = CollationSeq::known_custom(collation_name.as_str()).is_some();
+            if uses_custom {
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("reading a constraint cannot fail");
+    uses_custom
 }
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
@@ -371,10 +447,19 @@ fn estimate_constraint_selectivity(
     table_reference: &JoinedTable,
     column: Option<&Column>,
     operator: ConstraintOperator,
+    null_matching: bool,
     index: Option<&Index>,
     params: &CostModelParams,
     is_rowid: bool,
 ) -> f64 {
+    // `a IS 5` filters exactly like `a = 5` — the key is never NULL — so give
+    // it the `=` estimate. Only a NULL-matching `IS` keeps its own, much less
+    // selective, estimate (see [Constraint::null_matching]).
+    let operator = if operator.as_ast_operator() == Some(ast::Operator::Is) && !null_matching {
+        ConstraintOperator::from(ast::Operator::Equals)
+    } else {
+        operator
+    };
     estimate_selectivity(
         schema,
         table_reference.table.get_name(),
@@ -435,6 +520,178 @@ fn expression_matches_table(
     }
 }
 
+pub(super) fn add_implied_column_equalities(
+    where_clause: &mut Vec<WhereTerm>,
+    table_references: &TableReferences,
+) -> Result<()> {
+    let mut columns = Vec::new();
+    let mut parents = Vec::new();
+    let mut direct_pairs = Vec::new();
+
+    for term in where_clause
+        .iter()
+        .filter(|term| !term.origin.is_outer_join())
+    {
+        let Some((left, operator, right)) = as_binary_components(&term.expr)? else {
+            continue;
+        };
+        if operator.as_ast_operator() != Some(ast::Operator::Equals) {
+            continue;
+        }
+        let (Some((left_table, left_column)), Some((right_table, right_column))) =
+            (plain_column(left), plain_column(right))
+        else {
+            continue;
+        };
+        if left_table == right_table
+            || table_is_anti_joined(table_references, left_table)
+            || table_is_anti_joined(table_references, right_table)
+        {
+            continue;
+        }
+
+        let left_affinity = get_expr_affinity(left, Some(table_references), None);
+        let right_affinity = get_expr_affinity(right, Some(table_references), None);
+        let left_collation = get_collseq_from_expr(left, table_references)?.unwrap_or_default();
+        let right_collation = get_collseq_from_expr(right, table_references)?.unwrap_or_default();
+        if left_affinity != right_affinity
+            || left_collation != right_collation
+            || !matches!(
+                left_collation,
+                CollationSeq::Binary | CollationSeq::NoCase | CollationSeq::Rtrim
+            )
+        {
+            continue;
+        }
+
+        let left_index = find_or_add_equal_column(
+            &mut columns,
+            &mut parents,
+            left_table,
+            left_column,
+            left.clone(),
+        );
+        let right_index = find_or_add_equal_column(
+            &mut columns,
+            &mut parents,
+            right_table,
+            right_column,
+            right.clone(),
+        );
+        direct_pairs.push(ordered_pair(left_index, right_index));
+        union_equal_columns(&mut parents, left_index, right_index);
+    }
+
+    let mut inferred = Vec::new();
+    for member in 0..columns.len() {
+        let representative = equal_column_root(&mut parents, member);
+        if representative == member
+            || columns[representative].table == columns[member].table
+            || direct_pairs.contains(&ordered_pair(representative, member))
+            || both_columns_are_rowid_aliases(&columns[representative].expr, &columns[member].expr)
+        {
+            continue;
+        }
+        inferred.push(WhereTerm {
+            expr: ast::Expr::Binary(
+                Box::new(columns[representative].expr.clone()),
+                ast::Operator::Equals,
+                Box::new(columns[member].expr.clone()),
+            ),
+            origin: WhereTermOrigin::Where,
+            // The inferred term can select an access path. The original
+            // equalities still verify the result during execution.
+            consumed: true,
+        });
+    }
+
+    where_clause.extend(inferred);
+    Ok(())
+}
+
+fn both_columns_are_rowid_aliases(left: &ast::Expr, right: &ast::Expr) -> bool {
+    matches!(
+        left,
+        ast::Expr::Column {
+            is_rowid_alias: true,
+            ..
+        }
+    ) && matches!(
+        right,
+        ast::Expr::Column {
+            is_rowid_alias: true,
+            ..
+        }
+    )
+}
+
+struct EqualColumn {
+    table: TableInternalId,
+    column: usize,
+    expr: ast::Expr,
+}
+
+fn plain_column(expr: &ast::Expr) -> Option<(TableInternalId, usize)> {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    Some((*table, *column))
+}
+
+fn table_is_anti_joined(table_references: &TableReferences, table: TableInternalId) -> bool {
+    table_references
+        .find_joined_table_by_internal_id(table)
+        .and_then(|table| table.join_info.as_ref())
+        .is_some_and(JoinInfo::is_anti)
+}
+
+fn find_or_add_equal_column(
+    columns: &mut Vec<EqualColumn>,
+    parents: &mut Vec<usize>,
+    table: TableInternalId,
+    column: usize,
+    expr: ast::Expr,
+) -> usize {
+    if let Some(index) = columns
+        .iter()
+        .position(|item| item.table == table && item.column == column)
+    {
+        return index;
+    }
+    let index = columns.len();
+    columns.push(EqualColumn {
+        table,
+        column,
+        expr,
+    });
+    parents.push(index);
+    index
+}
+
+fn ordered_pair(left: usize, right: usize) -> (usize, usize) {
+    (left.min(right), left.max(right))
+}
+
+fn union_equal_columns(parents: &mut [usize], left: usize, right: usize) {
+    let left_root = equal_column_root(parents, left);
+    let right_root = equal_column_root(parents, right);
+    if left_root != right_root {
+        let representative = left_root.min(right_root);
+        parents[left_root] = representative;
+        parents[right_root] = representative;
+    }
+}
+
+fn equal_column_root(parents: &mut [usize], column: usize) -> usize {
+    let parent = parents[column];
+    if parent == column {
+        return column;
+    }
+    let root = equal_column_root(parents, parent);
+    parents[column] = root;
+    root
+}
+
 /// Precompute all potentially usable [Constraints] from a WHERE clause.
 /// The resulting list of [TableConstraints] is then used to evaluate the best access methods for various join orders.
 ///
@@ -460,6 +717,7 @@ pub fn constraints_from_where_clause(
         let mut cs = TableConstraints {
             table_id: table_reference.internal_id,
             constraints: Vec::new(),
+            temporary_index_terms: SmallVec::new(),
             candidates: available_indexes
                 .indexes_for_table(table_reference.internal_id)
                 .map_or(Vec::new(), |indexes| {
@@ -468,6 +726,13 @@ pub fn constraints_from_where_clause(
                         // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
                         // pattern matching rather than btree index scans
                         .filter(|index| index.index_method.is_none())
+                        // A partial index can omit rows that a later RIGHT JOIN
+                        // or FULL JOIN must keep.
+                        .filter(|index| {
+                            index.where_clause.is_none()
+                                || !table_references
+                                    .is_left_of_right_or_full_join(table_reference.internal_id)
+                        })
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
@@ -486,16 +751,54 @@ pub fn constraints_from_where_clause(
         };
 
         for (i, term) in where_clause.iter().enumerate() {
-            // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
+            let join_origin = term.origin.join_origin();
+            // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
-            if let Some(outer_join_tbl) = term.from_outer_join {
+            if let Some(outer_join_tbl) = join_origin.and_then(JoinOrigin::outer_table) {
                 if outer_join_tbl != table_reference.internal_id {
                     continue;
                 }
             }
 
+            // A term must not constrain the loop of a table that an outer join
+            // can null-extend, except in the three cases below. Consuming the
+            // term into the access path filters that table's rows, which
+            // changes which rows of the other side count as unmatched. The
+            // join then emits NULL rows that never see the term.
+            //
+            // Exception 1: terms from this table's own ON clause define what
+            // counts as a match, so they are always fine.
+            //
+            // Exception 2: on the right side of a plain LEFT JOIN, the engine
+            // re-checks consumed WHERE terms when it emits the NULL row. Any
+            // operator except `IS` is never true on a NULL row, so the
+            // re-check removes that row. This does not apply to `IS`, to an ON
+            // term of a later join, or to a table at or left of a RIGHT JOIN or
+            // FULL JOIN, whose unmatched-row pass can bypass the access path.
+            //
+            // Exception 3: a table-function argument defines its source.
+            // It is not a post-join filter on that source.
+            let can_use_before_null_extension = |is_op: bool| {
+                let table = table_reference.internal_id;
+                term.origin.table_function_table() == Some(table)
+                    || join_origin.is_some_and(|origin| origin.right_table() == table)
+                    || (!table_references.is_at_or_left_of_right_or_full_join(table)
+                        && ((join_origin.is_none() && !is_op)
+                            || !table_references.outer_join_may_null_extend(table)))
+            };
+
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                // `x IS TRUE` checks whether x is true; it does not compare x
+                // with 1. For example, `2 IS TRUE` is true, so an index lookup
+                // for 1 would miss that row. The same rule applies to FALSE,
+                // and it holds through parentheses and COLLATE: `x IS (TRUE)`
+                // is still a truth test (see [truth_test_rhs]).
+                if matches!(operator.as_ast_operator(), Some(ast::Operator::Is))
+                    && truth_test_rhs(rhs).is_some()
+                {
+                    continue;
+                }
                 // Resolve the comparison affinity once per term per SQLite's
                 // `comparisonAffinity` (see `Constraint::comparison_affinity`)
                 // and propagate it to every constraint derived from this term.
@@ -503,6 +806,13 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
+                let outer_join_compatible = can_use_before_null_extension(is_op);
+                // See [Constraint::null_matching]. The constraining value sits
+                // on the opposite side of the constrained column.
+                let null_matching = |constraining_expr: &ast::Expr| {
+                    is_op && !is_non_null_literal(constraining_expr)
+                };
                 // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
                 match lhs {
                     ast::Expr::Column { table, column, .. } => {
@@ -520,13 +830,16 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     Some(table_column),
                                     operator,
+                                    null_matching(rhs),
                                     index_for_column(*column),
                                     params,
                                     false,
                                 ),
                                 usable: true,
+                                outer_join_compatible,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(rhs),
                             });
                         }
                     }
@@ -549,13 +862,16 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     col,
                                     operator,
+                                    null_matching(rhs),
                                     None,
                                     params,
                                     true,
                                 ),
                                 usable: true,
+                                outer_join_compatible,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(rhs),
                             });
                         }
                     }
@@ -571,6 +887,7 @@ pub fn constraints_from_where_clause(
                             table_reference,
                             None,
                             operator,
+                            null_matching(rhs),
                             None,
                             params,
                             false,
@@ -592,8 +909,10 @@ pub fn constraints_from_where_clause(
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                             selectivity,
                             usable: true,
+                            outer_join_compatible,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
+                            null_matching: null_matching(rhs),
                         });
                     }
                     _ => {}
@@ -614,13 +933,16 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     Some(table_column),
                                     operator,
+                                    null_matching(lhs),
                                     index_for_column(*column),
                                     params,
                                     false,
                                 ),
                                 usable: true,
+                                outer_join_compatible,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(lhs),
                             });
                         }
                     }
@@ -643,13 +965,16 @@ pub fn constraints_from_where_clause(
                                     table_reference,
                                     col,
                                     operator,
+                                    null_matching(lhs),
                                     None,
                                     params,
                                     true,
                                 ),
                                 usable: true,
+                                outer_join_compatible,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                null_matching: null_matching(lhs),
                             });
                         }
                     }
@@ -665,6 +990,7 @@ pub fn constraints_from_where_clause(
                             table_reference,
                             None,
                             operator,
+                            null_matching(lhs),
                             None,
                             params,
                             false,
@@ -686,8 +1012,10 @@ pub fn constraints_from_where_clause(
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                             selectivity,
                             usable: true,
+                            outer_join_compatible,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
+                            null_matching: null_matching(lhs),
                         });
                     }
                     _ => {}
@@ -739,8 +1067,10 @@ pub fn constraints_from_where_clause(
                             lhs_mask: rhs_mask,
                             selectivity,
                             usable: false, // IN uses a separate seek path, not the range-seek model
+                            outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid,
                             comparison_affinity: cmp_aff,
+                            null_matching: false,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -756,8 +1086,10 @@ pub fn constraints_from_where_clause(
                             lhs_mask: rhs_mask,
                             selectivity,
                             usable: false,
+                            outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
+                            null_matching: false,
                         });
                     }
                     _ => {}
@@ -779,7 +1111,6 @@ pub fn constraints_from_where_clause(
                     .expect("subquery not found");
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
-                    let estimated_values = params.in_subquery_rows;
                     let table_stats = schema
                         .analyze_stats
                         .table_stats(table_reference.table.get_name());
@@ -787,6 +1118,22 @@ pub fn constraints_from_where_clause(
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
+                    // Use the inner plan's row count instead of always using 25.
+                    // FIXME: The plan does not estimate distinct result values.
+                    // Until it does, cap this estimate at the square root of the
+                    // table row count.
+                    let planned_rows = match &subquery.state {
+                        SubqueryState::Unevaluated {
+                            plan: Some(inner_plan),
+                        } => match inner_plan.as_ref() {
+                            Plan::Select(plan) => plan.estimated_output_rows,
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let estimated_values = planned_rows
+                        .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
+                        .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
@@ -819,8 +1166,10 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: TableMask::default(), // non-correlated = no dependencies
                                 selectivity,
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
+                                outer_join_compatible: can_use_before_null_extension(false),
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
+                                null_matching: false,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -836,8 +1185,10 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: TableMask::default(),
                                 selectivity,
                                 usable: false,
+                                outer_join_compatible: can_use_before_null_extension(false),
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
+                                null_matching: false,
                             });
                         }
                         _ => {}
@@ -847,20 +1198,16 @@ pub fn constraints_from_where_clause(
         }
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
-        cs.constraints.sort_by(|a, b| {
-            if a.operator == ast::Operator::Equals.into() {
-                Ordering::Less
-            } else if b.operator == ast::Operator::Equals.into() {
-                Ordering::Greater
-            } else {
-                Ordering::Equal
-            }
-        });
+        // A stable partition, not a comparison: comparing two equalities as
+        // "less" in both directions is not a valid ordering, and now that `IS`
+        // counts as an equality there are more pairs that would hit it.
+        cs.constraints
+            .sort_by_key(|c| !is_equality_operator(c.operator));
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
             // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
-            if !constraint.usable {
+            if !constraint.usable || !constraint.outer_join_compatible {
                 continue;
             }
 
@@ -868,12 +1215,31 @@ pub fn constraints_from_where_clause(
                 .table_col_pos
                 .and_then(|pos| table_reference.table.columns().get(pos));
             let column_collation = constrained_column.map(|c| c.collation());
-            let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
-            // Index seek keys must use the same collation as the constrained column.
-            match (
-                get_collseq_from_expr(constraining_expr, table_references)?,
-                column_collation,
-            ) {
+            // Index seek keys compare with the index's collation, so the seek is
+            // only valid when the comparison itself uses that collation. The
+            // comparison collation follows the left operand, so a plain BINARY
+            // column on the left disqualifies an index on a NOCASE column even
+            // though neither side declares a collation explicitly.
+            let comparison_collation = if constraint.constraining_expr.is_some() {
+                get_collseq_from_expr(
+                    constraint.get_constraining_expr_ref(where_clause),
+                    table_references,
+                )?
+            } else {
+                let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
+                match as_binary_components(term_expr)? {
+                    Some((lhs, op, rhs))
+                        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
+                    {
+                        Some(resolve_comparison_collseq(lhs, rhs, table_references)?)
+                    }
+                    _ => get_collseq_from_expr(
+                        constraint.get_constraining_expr_ref(where_clause),
+                        table_references,
+                    )?,
+                }
+            };
+            match (comparison_collation, column_collation) {
                 (Some(collation), Some(column_collation)) if collation != column_collation => {
                     constraint.usable = false;
                     continue;
@@ -899,6 +1265,7 @@ pub fn constraints_from_where_clause(
                     constraint_vec_pos: i,
                     index_col_pos: 0,
                     sort_order: SortOrder::Asc,
+                    nulls_order: ast::NullsOrder::First,
                 });
             }
             for index in available_indexes
@@ -942,8 +1309,7 @@ pub fn constraints_from_where_clause(
                         {
                             continue;
                         }
-                        let idx_col_aff = constrained_column
-                            .affinity_with_strict(table_reference.table.is_strict());
+                        let idx_col_aff = constrained_column.affinity();
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
@@ -963,6 +1329,7 @@ pub fn constraints_from_where_clause(
                             constraint_vec_pos: i,
                             index_col_pos: position_in_index,
                             sort_order: index.columns[position_in_index].order,
+                            nulls_order: index.columns[position_in_index].effective_nulls_order(),
                         });
                     }
                 }
@@ -988,6 +1355,14 @@ pub fn constraints_from_where_clause(
             }
             true
         });
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs)
+            .into_iter()
+            .filter(|term| {
+                let constraint = &cs.constraints[term.constraint_vec_pos];
+                let where_term = &where_clause[constraint.where_clause_pos.0];
+                !expr_uses_custom_collation(&where_term.expr)
+            })
+            .collect();
         constraints.push(cs);
     }
 
@@ -1012,6 +1387,10 @@ pub struct EqConstraintRef {
     /// entire query (true for `col = 5`, false for `t2.x = t1.b` where the
     /// value changes per outer row in a nested-loop join).
     pub is_const: bool,
+    /// Whether this equality comes from `IS` instead of `=`. An `IS` equality
+    /// matches NULL keys, and an index (even a UNIQUE one) can store many NULL
+    /// keys, so an `IS` equality does not pin the column to at most one row.
+    pub null_matching: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1022,6 +1401,8 @@ pub struct RangeConstraintRef {
     pub index_col_pos: usize,
     /// sort order for the column in the index definition
     pub sort_order: SortOrder,
+    /// where the index column stores NULLs in its forward layout
+    pub nulls_order: ast::NullsOrder,
     /// equality constraint
     pub eq: Option<EqConstraintRef>,
     /// lower bound constraint (either > or >=)
@@ -1034,15 +1415,21 @@ pub struct RangeConstraintRef {
 /// Represent seek range which can be used in query planning to emit range scan over table or index
 pub struct SeekRangeConstraint {
     pub sort_order: SortOrder,
+    pub nulls_order: ast::NullsOrder,
     pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
     pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
 }
 
 impl SeekRangeConstraint {
-    pub fn new_eq(sort_order: SortOrder, eq: (ast::Operator, ast::Expr, Affinity)) -> Self {
+    pub fn new_eq(
+        sort_order: SortOrder,
+        nulls_order: ast::NullsOrder,
+        eq: (ast::Operator, ast::Expr, Affinity),
+    ) -> Self {
         Self {
             sort_order,
+            nulls_order,
             eq: Some(eq),
             lower_bound: None,
             upper_bound: None,
@@ -1050,12 +1437,14 @@ impl SeekRangeConstraint {
     }
     pub fn new_range(
         sort_order: SortOrder,
+        nulls_order: ast::NullsOrder,
         lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
         upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
         turso_assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
             sort_order,
+            nulls_order,
             eq: None,
             lower_bound,
             upper_bound,
@@ -1070,20 +1459,28 @@ impl RangeConstraintRef {
         constraints: &[Constraint],
         where_clause: &[WhereTerm],
         referenced_tables: Option<&TableReferences>,
+        resolver: Option<&Resolver>,
     ) -> SeekRangeConstraint {
         if let Some(ref eq) = self.eq {
             return SeekRangeConstraint::new_eq(
                 self.sort_order,
-                constraints[eq.constraint_pos]
-                    .get_constraining_expr(where_clause, referenced_tables),
+                self.nulls_order,
+                constraints[eq.constraint_pos].get_constraining_expr(
+                    where_clause,
+                    referenced_tables,
+                    resolver,
+                ),
             );
         }
         SeekRangeConstraint::new_range(
             self.sort_order,
-            self.lower_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
-            self.upper_bound
-                .map(|x| constraints[x].get_constraining_expr(where_clause, referenced_tables)),
+            self.nulls_order,
+            self.lower_bound.map(|x| {
+                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
+            }),
+            self.upper_bound.map(|x| {
+                constraints[x].get_constraining_expr(where_clause, referenced_tables, resolver)
+            }),
         )
     }
 }
@@ -1106,10 +1503,10 @@ pub fn usable_constraints_for_lhs_mask(
     refs: &[ConstraintRef],
     lhs_mask: &TableMask,
     table_idx: usize,
-) -> Vec<RangeConstraintRef> {
+) -> SmallVec<[RangeConstraintRef; 2]> {
     turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
-    let mut usable: Vec<RangeConstraintRef> = Vec::new();
+    let mut usable: SmallVec<[RangeConstraintRef; 2]> = SmallVec::new();
     let mut current_required_column_pos = 0;
     for cref in refs.iter() {
         let constraint = &constraints[cref.constraint_vec_pos];
@@ -1117,7 +1514,7 @@ pub fn usable_constraints_for_lhs_mask(
         if other_side_refers_to_self {
             // Self-referential constraints cannot seed a lookup, but if they are
             // on a later index column they also terminate the usable prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1126,7 +1523,7 @@ pub fn usable_constraints_for_lhs_mask(
             // Join-dependent constraints are only usable when every referenced
             // outer table is already on the left side of the join order. As
             // above, a missing earlier prefix column terminates the prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1171,7 +1568,7 @@ pub fn usable_constraints_for_lhs_mask(
         }
         let operator = constraints[cref.constraint_vec_pos].operator;
         let table_col_pos = constraints[cref.constraint_vec_pos].table_col_pos;
-        if operator == ast::Operator::Equals.into()
+        if is_equality_operator(operator)
             && usable
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
@@ -1181,13 +1578,15 @@ pub fn usable_constraints_for_lhs_mask(
             continue;
         }
         let constraint_group = match operator.as_ast_operator() {
-            Some(ast::Operator::Equals) => RangeConstraintRef {
+            Some(ast::Operator::Equals | ast::Operator::Is) => RangeConstraintRef {
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
+                nulls_order: cref.nulls_order,
                 eq: Some(EqConstraintRef {
                     constraint_pos: cref.constraint_vec_pos,
                     is_const: constraints[cref.constraint_vec_pos].lhs_mask.is_empty(),
+                    null_matching: constraints[cref.constraint_vec_pos].null_matching,
                 }),
                 lower_bound: None,
                 upper_bound: None,
@@ -1197,6 +1596,7 @@ pub fn usable_constraints_for_lhs_mask(
                     table_col_pos,
                     index_col_pos: cref.index_col_pos,
                     sort_order: cref.sort_order,
+                    nulls_order: cref.nulls_order,
                     eq: None,
                     lower_bound: Some(cref.constraint_vec_pos),
                     upper_bound: None,
@@ -1206,6 +1606,7 @@ pub fn usable_constraints_for_lhs_mask(
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
+                nulls_order: cref.nulls_order,
                 eq: None,
                 lower_bound: None,
                 upper_bound: Some(cref.constraint_vec_pos),
@@ -1231,31 +1632,23 @@ pub fn usable_constraints_for_join_order<'a>(
         .take(join_order.len() - 1)
         .map(|j| j.original_idx)
         .try_collect()?;
-    Ok(usable_constraints_for_lhs_mask(
-        constraints,
-        refs,
-        &lhs_mask,
-        table_idx,
-    ))
+    Ok(usable_constraints_for_lhs_mask(constraints, refs, &lhs_mask, table_idx).into_vec())
 }
 
-/// Order synthetic key columns for a materialized subquery seek index.
+/// Order key columns for a temporary index.
 ///
-/// Unlike ordinary index analysis, the ephemeral index does not have a fixed
-/// on-disk column order, so we can choose one that matches the intended probe
-/// shape. Equalities come first, followed by columns that are constrained only
-/// by ranges. Columns that have both equality and range predicates stay in the
-/// equality prefix; the range side is redundant for key ordering.
-pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usize> {
-    let mut equality_cols = Vec::new();
-    let mut range_only_cols = Vec::new();
+/// Equalities come first because an index cannot use a column after a range.
+/// A column with both an equality and a range stays in the equality part.
+pub fn ordered_ephemeral_key_columns(constraints: &[&Constraint]) -> SmallVec<[usize; 4]> {
+    let mut equality_cols = SmallVec::<[usize; 4]>::new();
+    let mut range_only_cols = SmallVec::<[usize; 4]>::new();
 
     for constraint in constraints {
         let Some(col_pos) = constraint.table_col_pos else {
             continue;
         };
         match constraint.operator.as_ast_operator() {
-            Some(ast::Operator::Equals) => equality_cols.push(col_pos),
+            Some(ast::Operator::Equals | ast::Operator::Is) => equality_cols.push(col_pos),
             Some(
                 ast::Operator::Greater
                 | ast::Operator::GreaterEquals
@@ -1277,6 +1670,36 @@ pub fn ordered_materialized_key_columns(constraints: &[&Constraint]) -> Vec<usiz
     ordered
 }
 
+fn query_term_implies_predicate(query: &ast::Expr, predicate: &ast::Expr) -> bool {
+    if exprs_are_equivalent(query, predicate) {
+        return true;
+    }
+    match unwrap_parens(predicate).unwrap_or(predicate) {
+        ast::Expr::Binary(left, ast::Operator::Or, right) => {
+            query_term_implies_predicate(query, left) || query_term_implies_predicate(query, right)
+        }
+        _ => false,
+    }
+}
+
+/// Returns `None` if the query WHERE does not prove every conjunct in the
+/// index WHERE.
+///
+/// Otherwise, it returns the positions of query terms that exactly match an
+/// index conjunct and can be consumed. A term that proves one side of an OR
+/// makes the index usable but is not returned because it must remain a filter.
+///
+/// For example, using this partial index:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// this will return 1 and 2:
+///
+/// SELECT a FROM t WHERE substr(a, 2, 2) == 'C' AND length(a) < 5 AND substr(a, 1, 1) == 'B';
+///
+/// And this will return `None`:
+///
+/// CREATE INDEX idx on t(a) WHERE length(a) < 1234 AND substr(a, 1, 1) == 'B';
 pub(super) fn partial_index_predicate_terms(
     index: &Index,
     table_reference: &JoinedTable,
@@ -1288,20 +1711,21 @@ pub(super) fn partial_index_predicate_terms(
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
-            return true;
+            return !term.origin.is_outer_join();
         };
         if join_info.is_full_outer() {
             return false;
         }
         if join_info.is_outer() {
-            return term.from_outer_join == Some(table_reference.internal_id);
+            return term.origin.join_origin()
+                == Some(JoinOrigin::Outer(table_reference.internal_id));
         }
         true
     };
     // Bind the index WHERE expression's column references to this query's
     // table reference so it can be compared symmetrically against bound query
-    // WHERE terms. Each conjunct of the index WHERE must match some query
-    // WHERE term for the partial index to be safe to use.
+    // WHERE terms. Each conjunct of the index WHERE must be implied by some
+    // query WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
     rewrite_between_exprs(&mut bound).ok()?;
@@ -1309,10 +1733,13 @@ pub(super) fn partial_index_predicate_terms(
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
-        let (term_idx, _) = query_where_clause.iter().enumerate().find(|(_, term)| {
-            can_use_query_term(term) && exprs_are_equivalent(index_conjunct, &term.expr)
+        let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {
+            can_use_query_term(term) && query_term_implies_predicate(&term.expr, index_conjunct)
         })?;
-        if !matched_terms.contains(&term_idx) {
+        // A query term that proves one branch of an OR makes the partial index
+        // usable, but does not make that term true for every row in the index.
+        // Keep it as a residual filter unless the whole conjunct matched.
+        if exprs_are_equivalent(index_conjunct, &term.expr) && !matched_terms.contains(&term_idx) {
             matched_terms.push(term_idx);
         }
     }
@@ -1454,7 +1881,20 @@ fn estimate_bound_expr_selectivity(
         let index = col_pos.and_then(|pos| {
             selectivity_index_for_column(schema, table_reference, available_indexes, pos)
         });
-        estimate_constraint_selectivity(schema, table_reference, col, op, index, params, is_rowid)
+        // For `IS`, the key can be NULL unless one side is a non-NULL literal
+        // (the constrained column is on the other side).
+        let null_matching = op.as_ast_operator() == Some(ast::Operator::Is)
+            && !(is_non_null_literal(lhs) || is_non_null_literal(rhs));
+        estimate_constraint_selectivity(
+            schema,
+            table_reference,
+            col,
+            op,
+            null_matching,
+            index,
+            params,
+            is_rowid,
+        )
     };
 
     match expr {
@@ -1526,6 +1966,7 @@ fn estimate_bound_expr_selectivity(
                     not: *not,
                     estimated_values: rhs.len() as f64,
                 },
+                false,
                 index,
                 params,
                 is_rowid,
@@ -1565,6 +2006,11 @@ pub fn convert_to_vtab_constraint(
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
+            // SQLite does not show an outer-join-incompatible term to xBestIndex.
+            // The `usable` field in ConstraintInfo only reports input readiness.
+            if !constraint.outer_join_compatible {
+                return None;
+            }
             let table_col_pos = constraint.table_col_pos?;
             let other_side_refers_to_self = constraint.lhs_mask.get(table_idx);
             if other_side_refers_to_self {
@@ -1581,6 +2027,22 @@ pub fn convert_to_vtab_constraint(
         })
         .collect();
     Ok(constraints)
+}
+
+/// Whether `op` constrains an index column to a single value, making it usable
+/// as an index seek key.
+///
+/// `IS` belongs here next to `=`: SQLite treats it as an index-usable equality
+/// that additionally matches NULL (`x IS NULL` seeks the index's NULL entries,
+/// and `x IS ?` with a NULL bind finds the rows whose key component is NULL).
+/// The only difference is in codegen: an `=` seek can stop early when its key is
+/// NULL because `NULL = NULL` is not true, while an `IS` seek must seek with the
+/// NULL key. See [`SeekDef::is_null_matching_key_component`].
+pub fn is_equality_operator(op: ConstraintOperator) -> bool {
+    matches!(
+        op.as_ast_operator(),
+        Some(ast::Operator::Equals | ast::Operator::Is)
+    )
 }
 
 fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
@@ -1807,11 +2269,15 @@ pub(crate) fn analyze_binary_term_for_index(
     }
 
     let table_column = table_col_pos.and_then(|pos| table_reference.table.columns().get(pos));
+    // See [Constraint::null_matching].
+    let null_matching = operator.as_ast_operator() == Some(ast::Operator::Is)
+        && !is_non_null_literal(constraining_expr);
     let selectivity = estimate_constraint_selectivity(
         schema,
         table_reference,
         table_column,
         operator,
+        null_matching,
         best_index.as_deref(),
         params,
         is_rowid,
@@ -1859,8 +2325,10 @@ pub(crate) fn analyze_binary_term_for_index(
         lhs_mask,
         selectivity,
         usable: true,
+        outer_join_compatible: true,
         is_rowid,
         comparison_affinity: Some(affinity),
+        null_matching,
     };
 
     Some(AnalyzedTerm {
@@ -1886,10 +2354,12 @@ fn find_best_index_for_constraint(
             table_col_pos: None,
             index_col_pos: 0,
             sort_order: SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                 Some(EqConstraintRef {
                     constraint_pos: 0,
                     is_const: false,
+                    null_matching: false,
                 })
             } else {
                 None
@@ -1916,10 +2386,12 @@ fn find_best_index_for_constraint(
             table_col_pos: Some(col_pos),
             index_col_pos: 0,
             sort_order: SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
             eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                 Some(EqConstraintRef {
                     constraint_pos: 0,
                     is_const: false,
+                    null_matching: false,
                 })
             } else {
                 None
@@ -1952,10 +2424,12 @@ fn find_best_index_for_constraint(
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,
                         sort_order: index.columns[0].order,
+                        nulls_order: index.columns[0].effective_nulls_order(),
                         eq: if operator.as_ast_operator() == Some(ast::Operator::Equals) {
                             Some(EqConstraintRef {
                                 constraint_pos: 0,
                                 is_const: false,
+                                null_matching: false,
                             })
                         } else {
                             None

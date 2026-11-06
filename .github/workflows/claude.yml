@@ -22,6 +22,7 @@ jobs:
     #
     # Authorized users: OWNER, MEMBER, COLLABORATOR (prevents abuse by external users)
     if: |
+      github.repository == 'tursodatabase/turso' && (
       (
         contains(fromJSON('["issue_comment", "pull_request_review_comment"]'), github.event_name) &&
         contains(github.event.comment.body, '@claude') &&
@@ -35,6 +36,7 @@ jobs:
       (
         github.event_name == 'issues' &&
         github.event.assignee.login == 'claude[bot]'
+      )
       )
     runs-on: ubuntu-latest
     timeout-minutes: 30

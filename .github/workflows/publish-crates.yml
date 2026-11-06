@@ -7,6 +7,7 @@ on:
 
 jobs:
   publish:
+    if: github.repository == 'tursodatabase/turso'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

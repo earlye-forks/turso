@@ -1,9 +1,8 @@
 use std::sync::Arc;
+use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -37,10 +36,10 @@ fn bench_graph_queries(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), DB_PATH).unwrap();
+    let db = Database::open_file(io.clone(), DB_PATH, Arc::new(SqliteDialect)).unwrap();
     let limbo_conn = db.connect().unwrap();
 
-    let db_analyzed = Database::open_file(io, DB_PATH_ANALYZED).unwrap();
+    let db_analyzed = Database::open_file(io, DB_PATH_ANALYZED, Arc::new(SqliteDialect)).unwrap();
     let limbo_conn_analyzed = db_analyzed.connect().unwrap();
 
     let queries = [
@@ -67,7 +66,9 @@ fn bench_graph_queries(criterion: &mut Criterion) {
                         turso_core::StepResult::Row => {
                             black_box(stmt.row());
                         }
-                        turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                        turso_core::StepResult::IO
+                        | turso_core::StepResult::Yield
+                        | turso_core::StepResult::Sleep { .. } => {
                             db.io.step().unwrap();
                         }
                         turso_core::StepResult::Done => {
@@ -93,7 +94,9 @@ fn bench_graph_queries(criterion: &mut Criterion) {
                             turso_core::StepResult::Row => {
                                 black_box(stmt.row());
                             }
-                            turso_core::StepResult::IO | turso_core::StepResult::Yield => {
+                            turso_core::StepResult::IO
+                            | turso_core::StepResult::Yield
+                            | turso_core::StepResult::Sleep { .. } => {
                                 db_analyzed.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
@@ -143,14 +146,6 @@ fn bench_graph_queries(criterion: &mut Criterion) {
     }
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = benches;
-    config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_graph_queries
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = benches;
     config = Criterion::default();

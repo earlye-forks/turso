@@ -14,10 +14,13 @@
 
 use std::sync::Arc;
 
-use turso_core::{Connection, Database, LimboError, MemoryYieldIO, StepResult, IO};
+use turso_core::{Connection, Database, LimboError, MemoryYieldIO, SqliteDialect, StepResult, IO};
 
 fn open_conn(io: Arc<MemoryYieldIO>, path: &str) -> Arc<Connection> {
-    Database::open_file(io, path).unwrap().connect().unwrap()
+    Database::open_file(io, path, Arc::new(SqliteDialect))
+        .unwrap()
+        .connect()
+        .unwrap()
 }
 
 fn integrity_check(conn: &Arc<Connection>) -> Vec<String> {
@@ -51,6 +54,7 @@ fn expect_unfinished_write_commit_error(result: turso_core::Result<()>, context:
 /// Steps `sql` until the `target_io`-th `StepResult::IO`, completes that I/O,
 /// then drops the statement without stepping it again. Returns false if the
 /// statement finished before reaching `target_io` I/Os.
+#[must_use]
 fn abandon_statement_after_io_completion(
     conn: &Arc<Connection>,
     io: &Arc<MemoryYieldIO>,
@@ -80,6 +84,7 @@ fn abandon_statement_after_io_completion(
 /// Steps `sql` until the `target_io`-th `StepResult::IO` and drops the
 /// statement while that I/O is still pending. Returns false if the statement
 /// finished before reaching `target_io` I/Os.
+#[must_use]
 fn abandon_statement_before_io_completion(
     conn: &Arc<Connection>,
     io: &Arc<MemoryYieldIO>,
@@ -282,6 +287,95 @@ fn test_abandoned_delete_does_not_poison_next_delete() {
     }
 }
 
+fn run_abandoned_delete_all_sweep(abandon_before_completion: bool) {
+    let payload = "x".repeat(20_000);
+
+    for target_io in 1..=128 {
+        let io = Arc::new(MemoryYieldIO::new());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let timing = if abandon_before_completion {
+            "before"
+        } else {
+            "after"
+        };
+        let path = temp_dir
+            .path()
+            .join(format!("abandoned-delete-all-{timing}-{target_io}.db"));
+        let path = path.to_str().unwrap();
+
+        {
+            let conn = open_conn(io.clone(), path);
+            seed_indexed_overflow_rows(&conn, &payload);
+        }
+
+        let conn = open_conn(io.clone(), path);
+        conn.execute("BEGIN").unwrap();
+
+        let abandoned = if abandon_before_completion {
+            abandon_statement_before_io_completion(&conn, &io, "DELETE FROM t", target_io)
+        } else {
+            abandon_statement_after_io_completion(&conn, &io, "DELETE FROM t", target_io)
+        };
+        if !abandoned {
+            conn.execute("ROLLBACK").unwrap();
+            assert!(
+                target_io > 1,
+                "whole-table DELETE finished without any I/O. The abandonment sweep never ran"
+            );
+            break;
+        }
+
+        // Run another write after any combination of index and table clears.
+        // COMMIT must restore every B-tree because the first statement did not finish.
+        conn.execute(format!("INSERT INTO t VALUES(9, 9, '{payload}')"))
+            .unwrap();
+        expect_unfinished_write_commit_error(
+            conn.execute("COMMIT"),
+            &format!(
+                "target_io={target_io} ({timing} completion): COMMIT after abandoned whole-table DELETE"
+            ),
+        );
+
+        assert_eq!(
+            ids(&conn, "SELECT id FROM t ORDER BY id"),
+            vec![2, 3, 4, 5, 6, 7, 8],
+            "target_io={target_io} ({timing} completion): rejected COMMIT must restore table rows"
+        );
+        assert_eq!(
+            ids(&conn, "SELECT id FROM t INDEXED BY t_x ORDER BY x"),
+            vec![2, 3, 4, 5, 6, 7, 8],
+            "target_io={target_io} ({timing} completion): rejected COMMIT must restore index entries"
+        );
+
+        // DELETE and INSERT must still work after the rollback. This test detects stale
+        // root-page, cursor, or freelist state from the unfinished statement.
+        conn.execute("DELETE FROM t").unwrap();
+        assert!(ids(&conn, "SELECT id FROM t").is_empty());
+        conn.execute(format!("INSERT INTO t VALUES(10, 10, '{payload}')"))
+            .unwrap();
+        assert_eq!(
+            ids(&conn, "SELECT id FROM t INDEXED BY t_x ORDER BY x"),
+            vec![10],
+            "target_io={target_io} ({timing} completion): refill after rollback is missing"
+        );
+        assert_eq!(
+            integrity_check(&conn),
+            vec!["ok"],
+            "target_io={target_io} ({timing} completion): abandoned clear poisoned storage"
+        );
+    }
+}
+
+#[test]
+fn test_delete_all_abandoned_before_io_completion_restores_every_btree() {
+    run_abandoned_delete_all_sweep(true);
+}
+
+#[test]
+fn test_delete_all_abandoned_after_io_completion_restores_every_btree() {
+    run_abandoned_delete_all_sweep(false);
+}
+
 #[test]
 fn test_abandoned_insert_does_not_poison_next_insert() {
     let payload = "x".repeat(20_000);
@@ -341,6 +435,109 @@ fn test_abandoned_insert_does_not_poison_next_insert() {
             ids(&conn, "SELECT id FROM t INDEXED BY t_x ORDER BY x"),
             vec![2, 3, 4, 5, 6, 7, 8, 10],
             "target_io={target_io}: indexed scan disagrees after next INSERT"
+        );
+    }
+}
+
+/// Regression test for issue #8291.
+///
+/// A single big INSERT pushes the WAL past the 1000-frame auto-checkpoint
+/// threshold, so its commit runs a checkpoint that yields for I/O after the
+/// WAL commit is durable and the WAL locks are released. Resetting the
+/// statement at one of those yields used to panic: the connection's
+/// transaction state was still `Write`, so the abort path called
+/// `wal.end_write_tx()` for locks that were already released, tripping the
+/// "write lock not held" assertion in wal.rs. This sweeps every I/O boundary
+/// of the INSERT, resets the statement there, and asserts the reset does not
+/// panic and leaves the connection usable.
+#[test]
+fn test_reset_during_post_commit_auto_checkpoint() {
+    // ~1200 overflow pages at page_size 512, so one commit crosses the
+    // 1000-frame auto-checkpoint threshold.
+    const INSERT: &str = "INSERT INTO t VALUES (1, zeroblob(600000))";
+
+    fn setup(io: &Arc<MemoryYieldIO>, path: &str) -> Arc<Connection> {
+        let conn = open_conn(io.clone(), path);
+        conn.execute("PRAGMA page_size=512").unwrap();
+        conn.execute("PRAGMA journal_mode = 'wal'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB)")
+            .unwrap();
+        conn
+    }
+
+    // Dry run: count the INSERT's I/O yields so the sweep below can visit
+    // every boundary, including the ones inside the auto-checkpoint at the
+    // end.
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let total_ios = {
+        let io = Arc::new(MemoryYieldIO::new());
+        let path = temp_dir.path().join("dry-run.db");
+        let conn = setup(&io, path.to_str().unwrap());
+        let mut stmt = conn.prepare(INSERT).unwrap();
+        let mut count = 0usize;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::IO => {
+                    count += 1;
+                    io.step().unwrap();
+                }
+                StepResult::Done => break,
+                StepResult::Yield => {}
+                other => panic!("unexpected step result in dry run: {other:?}"),
+            }
+        }
+        count
+    };
+    assert!(
+        total_ios > 2,
+        "INSERT must yield for I/O several times for the sweep to mean anything"
+    );
+
+    for target_io in 1..=total_ios {
+        let io = Arc::new(MemoryYieldIO::new());
+        let path = temp_dir.path().join(format!("reset-at-{target_io}.db"));
+        let conn = setup(&io, path.to_str().unwrap());
+
+        let mut stmt = conn.prepare(INSERT).unwrap();
+        let mut io_count = 0usize;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::IO => {
+                    io_count += 1;
+                    io.step().unwrap();
+                    if io_count == target_io {
+                        break;
+                    }
+                }
+                StepResult::Done => {
+                    panic!("target_io={target_io}: INSERT finished before the target boundary")
+                }
+                StepResult::Yield => {}
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+
+        // Before the fix this panicked with "end_write_tx called while write
+        // lock not held according to connection state" when target_io landed
+        // inside the post-commit auto-checkpoint.
+        stmt.reset()
+            .unwrap_or_else(|e| panic!("target_io={target_io}: reset failed: {e}"));
+        drop(stmt);
+
+        // The reset either rolled the INSERT back (mid-write) or interrupted
+        // only the checkpoint of an already-committed INSERT, so the row
+        // count is 0 or 1 and the connection must stay fully usable.
+        let count = ids(&conn, "SELECT count(*) FROM t")[0];
+        assert!(
+            (0..=1).contains(&count),
+            "target_io={target_io}: unexpected row count {count}"
+        );
+        conn.execute("INSERT INTO t VALUES (2, zeroblob(1000))")
+            .unwrap();
+        assert_eq!(
+            integrity_check(&conn),
+            vec!["ok"],
+            "target_io={target_io}: reset during commit corrupted the database"
         );
     }
 }

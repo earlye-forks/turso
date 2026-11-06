@@ -16,13 +16,16 @@ use crate::{
         plan::{
             BitSet, Distinctness, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinOrderMember,
             Operation, QueryDestination, Scan, Search, SeekKeyComponent, SelectPlan,
-            SimpleAggregate,
+            SimpleAggregate, SubqueryEvalPhase,
         },
         planner::table_mask_from_expr,
         select::emit_simple_count,
-        subquery::{emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at},
+        subquery::{
+            emit_from_clause_subqueries, emit_non_from_clause_subqueries_for_eval_at,
+            emit_non_from_clause_subqueries_for_phase,
+        },
         values::emit_values,
-        window::{emit_window_results, EmitWindow},
+        window::{emit_window_flush, EmitWindow},
         ProgramBuilder, Resolver,
     },
     vdbe::insn::Insn,
@@ -104,6 +107,7 @@ pub fn emit_query<'a>(
 
     // Handle VALUES clause - emit values after subqueries are prepared
     if !plan.values.is_empty() {
+        init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
         let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
         program.preassign_label_to_next_insn(after_main_loop_label);
         return Ok(reg_result_cols_start);
@@ -202,7 +206,7 @@ pub fn emit_query<'a>(
         program.emit_insn(Insn::HashClear {
             hash_table_id: ctx.hash_table_id,
         });
-        emit_explain!(program, false, "USE HASH TABLE FOR DISTINCT".to_owned());
+        emit_explain!(program, false, crate::translate::eqp::EqpDetail::Distinct);
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
@@ -251,6 +255,18 @@ pub fn emit_query<'a>(
         &mut plan.non_from_clause_subqueries,
     )?;
 
+    // A RIGHT or FULL JOIN can call this row body after the main loops finish.
+    // Output subqueries must read the NULL-row state set by that later call.
+    emit_non_from_clause_subqueries_for_phase(
+        program,
+        &t_ctx.resolver,
+        &mut plan.non_from_clause_subqueries,
+        &plan.join_order,
+        Some(&plan.table_references),
+        SubqueryEvalPhase::RowOutput,
+        |_| true,
+    )?;
+
     // Process result columns and expressions in the inner loop
     LoopBodyEmitter::emit(program, t_ctx, plan)?;
 
@@ -283,9 +299,9 @@ pub fn emit_query<'a>(
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
-        emit_ungrouped_aggregation(program, t_ctx, plan)?;
+        emit_ungrouped_aggregation(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if plan.window.is_some() {
-        emit_window_results(program, t_ctx, plan)?;
+        emit_window_flush(program, t_ctx, plan)?;
     }
 
     // Process ORDER BY results if needed
@@ -307,19 +323,17 @@ struct MaterializationSpec {
     payload_columns: Vec<MaterializedColumnRef>,
 }
 
-/// Build materialized hash-build inputs for hash joins that depend on prior joins.
+/// Store filtered hash-build inputs before the hash table is built.
 ///
 /// A materialized build input is an ephemeral table that captures the rows
-/// a hash join is allowed to build from after earlier joins and filters have
-/// been applied. This prevents the build side from being re-scanned in its
-/// full, unfiltered form when prior join constraints must be respected.
+/// a hash join can use after earlier reads and filters have run. This prevents
+/// a second, unfiltered scan of the build table.
 ///
 /// The materialization uses a join-prefix: all tables that appear before the
 /// probe table in the join order, plus the build table itself. This prefix
 /// represents the minimal context needed to evaluate build-side constraints.
-/// For probe->build chaining we store join keys and payload columns directly
-/// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
-/// during probing when needed.
+/// The table stores keys and payload for a filtered read or a multi-table
+/// prefix. It can store rowids for a single unfiltered table.
 pub(crate) fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -351,6 +365,7 @@ pub(crate) fn emit_materialized_build_inputs(
                 continue;
             }
             seen_build_tables.set(hash_join_op.build_table_idx)?;
+            let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -401,10 +416,14 @@ pub(crate) fn emit_materialized_build_inputs(
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
+            let build_read_is_in_seek =
+                matches!(build_table.op, Operation::Search(Search::InSeek { .. }));
 
-            if build_table_was_prior_probe || prefix_has_other_tables {
-                // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
-                // so we do not lose multiplicity or correlation.
+            if build_table_was_prior_probe
+                || prefix_has_other_tables
+                || build_read_is_in_seek
+                || build_table.selected_index_stores_used_columns()
+            {
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys
@@ -441,15 +460,6 @@ pub(crate) fn emit_materialized_build_inputs(
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
-        let build_table_name = if build_table.table.get_name() == build_table.identifier {
-            build_table.identifier.clone()
-        } else {
-            format!(
-                "{} AS {}",
-                build_table.table.get_name(),
-                build_table.identifier
-            )
-        };
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
             MaterializedBuildInputMode::RowidOnly => {
@@ -491,7 +501,10 @@ pub(crate) fn emit_materialized_build_inputs(
         emit_explain!(
             program,
             true,
-            format!("MATERIALIZE hash build input for {build_table_name}")
+            crate::translate::eqp::EqpDetail::HashBuild {
+                table: crate::translate::eqp::EqpTable::from_joined(build_table),
+                estimate: build_table.plan_estimate,
+            }
         );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,
@@ -527,6 +540,10 @@ pub(crate) fn emit_materialized_build_inputs(
                 prefix_tables: spec.prefix_tables.clone(),
             },
         );
+    }
+
+    for build_table_idx in build_inputs.keys() {
+        plan.table_references.joined_tables_mut()[*build_table_idx].clear_expression_index_usages();
     }
 
     // Drop any join-prefix tables already captured by key+payload materializations.
@@ -609,9 +626,9 @@ fn prune_join_order_for_materialized_inputs(
         if term.consumed {
             continue;
         }
-        if term.from_outer_join.is_some() {
+        if term.origin.is_outer_join() {
             // OUTER JOIN terms still belong to the right-table loop recorded in
-            // `from_outer_join`. Materializing and pruning the build-side prefix
+            // `origin`. Materializing and pruning the build-side prefix
             // does not make those terms safe to consume here, because the
             // materialization subplan does not include the probe table that
             // determines the null-extension boundary.
@@ -808,6 +825,14 @@ fn build_materialized_build_input_plan(
     // the materialization subplan does not try to use an access path that
     // requires tables outside the prefix. If it does, we fall back to a scan.
     let mut table_references = plan.table_references.clone();
+    if matches!(mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+        for table_idx in included_tables.iter() {
+            let table = &mut table_references.joined_tables_mut()[table_idx];
+            if !table.selected_index_stores_used_columns() {
+                table.clear_expression_index_usages();
+            }
+        }
+    }
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
             if hash_join_op.build_table_idx == build_table_idx {
@@ -989,6 +1014,7 @@ fn build_materialized_build_input_plan(
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
         input_cardinality_hint: None,
         estimated_output_rows: None,
+        estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
     };

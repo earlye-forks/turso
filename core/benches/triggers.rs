@@ -1,7 +1,6 @@
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
+use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
@@ -39,7 +38,7 @@ fn run_to_completion(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 db.io.step()?;
             }
             StepResult::Done => break,
@@ -56,7 +55,7 @@ fn setup_limbo(temp_dir: &TempDir, stmts: &[&str]) -> Arc<Database> {
     let db_path = temp_dir.path().join("bench.db");
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, db_path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
 
     let mut stmt = conn.query("PRAGMA synchronous = OFF").unwrap().unwrap();
@@ -571,21 +570,6 @@ fn bench_before_trigger(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = trigger_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-        .sample_size(30);
-    targets =
-        bench_multirow_insert_with_trigger,
-        bench_wide_table_sparse_trigger,
-        bench_multiple_triggers,
-        bench_trigger_overhead,
-        bench_before_trigger
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = trigger_benches;
     config = Criterion::default().sample_size(30);

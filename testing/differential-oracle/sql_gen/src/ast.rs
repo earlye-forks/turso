@@ -665,9 +665,14 @@ pub struct FromClause {
 #[derive(Debug, Clone)]
 pub struct JoinClause {
     pub join_type: JoinType,
+    /// SQLite treats NATURAL as a modifier that can combine with LEFT, RIGHT, or FULL.
+    pub natural: bool,
     pub table: String,
     pub alias: Option<String>,
     pub constraint: Option<JoinConstraint>,
+    /// Parenthesized groups that end after this join, innermost first. Each
+    /// group starts before the FROM table. An entry holds the group alias.
+    pub closed_groups: Vec<Option<String>>,
 }
 
 /// The type of JOIN.
@@ -675,14 +680,37 @@ pub struct JoinClause {
 pub enum JoinType {
     Inner,
     Left,
+    Right,
+    Full,
     Cross,
-    Natural,
 }
 
-/// A JOIN constraint (ON condition).
+impl fmt::Display for JoinType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinType::Inner => write!(f, "JOIN"),
+            JoinType::Left => write!(f, "LEFT JOIN"),
+            JoinType::Right => write!(f, "RIGHT JOIN"),
+            JoinType::Full => write!(f, "FULL JOIN"),
+            JoinType::Cross => write!(f, "CROSS JOIN"),
+        }
+    }
+}
+
+/// An ON or USING clause for a JOIN.
 #[derive(Debug, Clone)]
 pub enum JoinConstraint {
     On(Expr),
+    Using(Vec<String>),
+}
+
+impl fmt::Display for JoinConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JoinConstraint::On(expr) => write!(f, "ON {expr}"),
+            JoinConstraint::Using(columns) => write!(f, "USING ({})", columns.join(", ")),
+        }
+    }
 }
 
 /// A compound operator connecting two SELECT arms.
@@ -787,25 +815,24 @@ impl fmt::Display for SelectStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {}", from.table)?;
+            write!(f, " FROM {}{}", group_starts(&self.joins), from.table)?;
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
         }
 
         for join in &self.joins {
-            match join.join_type {
-                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
-                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
-                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
-                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            if join.natural {
+                write!(f, " NATURAL")?;
             }
+            write!(f, " {} {}", join.join_type, join.table)?;
             if let Some(alias) = &join.alias {
                 write!(f, " AS {alias}")?;
             }
-            if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                write!(f, " ON {expr}")?;
+            if let Some(constraint) = &join.constraint {
+                write!(f, " {constraint}")?;
             }
+            write_group_ends(f, join)?;
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1003,6 +1030,13 @@ pub struct UpdateStmt {
     pub where_clause: Option<Expr>,
     pub conflict: Option<ConflictClause>,
     pub returning: Option<Vec<Expr>>,
+    /// Emit `NOT INDEXED` on the target and every FROM/JOIN table, forcing a
+    /// rowid-order table scan. An `UPDATE ... FROM` where a target row matches
+    /// several source rows uses one of them, and which one depends on the scan
+    /// order the planner picks — Turso favors a covering index, SQLite a table
+    /// scan, so the results differ. Pinning both engines to a table scan makes
+    /// the choice deterministic.
+    pub not_indexed: bool,
 }
 
 impl fmt::Display for UpdateStmt {
@@ -1014,10 +1048,23 @@ impl fmt::Display for UpdateStmt {
         if let Some(conflict) = &self.conflict {
             write!(f, "{conflict}")?;
         }
+        // `NOT INDEXED` follows the (optional) alias on the target and on every
+        // FROM/JOIN table, per the qualified-table-name grammar. It only
+        // applies to real tables: a subquery source (`(SELECT ...)`) cannot
+        // take it, so skip those.
+        let not_indexed = |table: &str| -> &'static str {
+            if self.not_indexed && !table.trim_start().starts_with('(') {
+                " NOT INDEXED"
+            } else {
+                ""
+            }
+        };
+
         write!(f, " {}", self.table)?;
         if let Some(alias) = &self.alias {
             write!(f, " AS {alias}")?;
         }
+        write!(f, "{}", not_indexed(&self.table))?;
         write!(f, " SET ")?;
 
         for (i, (col, val)) in self.sets.iter().enumerate() {
@@ -1028,25 +1075,26 @@ impl fmt::Display for UpdateStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {}", from.table)?;
+            write!(f, " FROM {}{}", group_starts(&self.joins), from.table)?;
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
+            write!(f, "{}", not_indexed(&from.table))?;
         }
 
         for join in &self.joins {
-            match join.join_type {
-                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
-                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
-                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
-                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            if join.natural {
+                write!(f, " NATURAL")?;
             }
+            write!(f, " {} {}", join.join_type, join.table)?;
             if let Some(alias) = &join.alias {
                 write!(f, " AS {alias}")?;
             }
-            if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                write!(f, " ON {expr}")?;
+            write!(f, "{}", not_indexed(&join.table))?;
+            if let Some(constraint) = &join.constraint {
+                write!(f, " {constraint}")?;
             }
+            write_group_ends(f, join)?;
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1065,6 +1113,21 @@ impl fmt::Display for UpdateStmt {
 
         Ok(())
     }
+}
+
+fn group_starts(joins: &[JoinClause]) -> String {
+    let group_count = joins.iter().map(|join| join.closed_groups.len()).sum();
+    "(".repeat(group_count)
+}
+
+fn write_group_ends(f: &mut fmt::Formatter<'_>, join: &JoinClause) -> fmt::Result {
+    for alias in &join.closed_groups {
+        write!(f, ")")?;
+        if let Some(alias) = alias {
+            write!(f, " AS {alias}")?;
+        }
+    }
+    Ok(())
 }
 
 /// A DELETE statement.
@@ -1481,10 +1544,9 @@ pub enum Expr {
     Parenthesized(Box<Expr>),
     /// ARRAY[expr, expr, ...] — array literal constructor
     ArrayLiteral(ArrayLiteralExpr),
-    /// expr[n] — array subscript
+    /// `expr[n]` — array subscript
     ArraySubscript(Box<ArraySubscriptExpr>),
-    // Stubs: not yet generated (weight 0), shown in coverage report
-    /// expr OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)
+    /// `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
     WindowFunction(Box<WindowFunctionExpr>),
     /// expr COLLATE collation_name
     Collate(Box<CollateExpr>),
@@ -1511,8 +1573,8 @@ impl fmt::Display for Expr {
             Expr::Parenthesized(e) => write!(f, "({e})"),
             Expr::ArrayLiteral(a) => write!(f, "{a}"),
             Expr::ArraySubscript(a) => write!(f, "{a}"),
+            Expr::WindowFunction(w) => write!(f, "{w}"),
             // Stubs
-            Expr::WindowFunction(_) => todo!("window function generation"),
             Expr::Collate(_) => todo!("COLLATE expression generation"),
             Expr::Raise(_) => todo!("RAISE expression generation"),
         }
@@ -1645,10 +1707,23 @@ impl Expr {
         Expr::Parenthesized(Box::new(expr))
     }
 
-    /// Create a window function expression (stub — records to context).
-    pub fn window_function(ctx: &mut Context) -> Self {
+    /// Create a window function expression (records to context).
+    pub fn window_function(
+        ctx: &mut Context,
+        name: String,
+        args: Vec<Expr>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<(Expr, OrderDirection)>,
+        frame: Option<WindowFrame>,
+    ) -> Self {
         ctx.record(ExprKind::WindowFunction);
-        todo!("window function generation")
+        Expr::WindowFunction(Box::new(WindowFunctionExpr {
+            name,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        }))
     }
 
     /// Create a COLLATE expression (stub — records to context).
@@ -1772,7 +1847,7 @@ pub enum BinOp {
     BitOr,
     LeftShift,
     RightShift,
-    // Null-safe comparison (stubs — weight 0)
+    // Null-safe comparison
     Is,
     IsNot,
     // Pattern matching (stub — weight 0)
@@ -1819,6 +1894,10 @@ impl fmt::Display for BinOp {
 
 impl BinOp {
     /// Returns comparison operators.
+    ///
+    /// `IS` / `IS NOT` are here because they are ordinary comparisons that happen
+    /// to compare NULLs as equal, and because `IS` seeks an index the same way `=`
+    /// does — so leaving them out hid a whole class of query plans.
     pub fn comparison() -> &'static [BinOp] {
         &[
             BinOp::Eq,
@@ -1827,6 +1906,8 @@ impl BinOp {
             BinOp::Le,
             BinOp::Gt,
             BinOp::Ge,
+            BinOp::Is,
+            BinOp::IsNot,
         ]
     }
 
@@ -1891,7 +1972,9 @@ pub struct UnaryOpExpr {
 impl fmt::Display for UnaryOpExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.op {
-            UnaryOp::Neg => write!(f, "-{}", self.operand),
+            // Without the space, two nested minus operators become `--`,
+            // which starts a SQL comment and hides the rest of the statement.
+            UnaryOp::Neg => write!(f, "- {}", self.operand),
             UnaryOp::Not => write!(f, "NOT {}", self.operand),
             UnaryOp::BitNot => write!(f, "~{}", self.operand),
         }
@@ -2058,9 +2141,141 @@ pub struct InSubqueryExpr {
 // Stub expression types (not yet generated)
 // =============================================================================
 
-/// A window function expression (stub).
+/// Window frame mode emitted by the SQL generator.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameMode {
+    Rows,
+    Groups,
+    Range,
+}
+
+impl fmt::Display for WindowFrameMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rows => write!(f, "ROWS"),
+            Self::Groups => write!(f, "GROUPS"),
+            Self::Range => write!(f, "RANGE"),
+        }
+    }
+}
+
+/// One boundary of a generated window frame.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameBoundary {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+impl fmt::Display for WindowFrameBoundary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnboundedPreceding => write!(f, "UNBOUNDED PRECEDING"),
+            Self::Preceding(offset) => write!(f, "{offset} PRECEDING"),
+            Self::CurrentRow => write!(f, "CURRENT ROW"),
+            Self::Following(offset) => write!(f, "{offset} FOLLOWING"),
+            Self::UnboundedFollowing => write!(f, "UNBOUNDED FOLLOWING"),
+        }
+    }
+}
+
+/// Rows omitted from a generated window frame before aggregate evaluation.
+#[derive(Debug, Clone, Copy)]
+pub enum WindowFrameExclude {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
+}
+
+impl fmt::Display for WindowFrameExclude {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoOthers => write!(f, "NO OTHERS"),
+            Self::CurrentRow => write!(f, "CURRENT ROW"),
+            Self::Group => write!(f, "GROUP"),
+            Self::Ties => write!(f, "TIES"),
+        }
+    }
+}
+
+/// A generated `ROWS`/`GROUPS`/`RANGE BETWEEN ... AND ...` clause.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowFrame {
+    pub mode: WindowFrameMode,
+    pub start: WindowFrameBoundary,
+    pub end: WindowFrameBoundary,
+    pub exclude: Option<WindowFrameExclude>,
+}
+
+impl fmt::Display for WindowFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} BETWEEN {} AND {}", self.mode, self.start, self.end)?;
+        if let Some(exclude) = self.exclude {
+            write!(f, " EXCLUDE {exclude}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A window function expression: `func(args) OVER (...)`.
 #[derive(Debug, Clone)]
-pub struct WindowFunctionExpr;
+pub struct WindowFunctionExpr {
+    pub name: String,
+    pub args: Vec<Expr>,
+    /// Optional list of partition expressions.
+    pub partition_by: Vec<Expr>,
+    /// Optional list of order-by expressions with direction.
+    pub order_by: Vec<(Expr, OrderDirection)>,
+    /// Optional explicit frame clause.
+    pub frame: Option<WindowFrame>,
+}
+
+impl fmt::Display for WindowFunctionExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.name)?;
+        for (i, arg) in self.args.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{arg}")?;
+        }
+        write!(f, ") OVER (")?;
+        let mut first_clause = true;
+        if !self.partition_by.is_empty() {
+            write!(f, "PARTITION BY ")?;
+            for (i, e) in self.partition_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{e}")?;
+            }
+            first_clause = false;
+        }
+        if !self.order_by.is_empty() {
+            if !first_clause {
+                write!(f, " ")?;
+            }
+            write!(f, "ORDER BY ")?;
+            for (i, (e, dir)) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{e} {dir}")?;
+            }
+            first_clause = false;
+        }
+        if let Some(frame) = self.frame {
+            if !first_clause {
+                write!(f, " ")?;
+            }
+            write!(f, "{frame}")?;
+        }
+        write!(f, ")")
+    }
+}
 
 /// A COLLATE expression (stub).
 #[derive(Debug, Clone)]
@@ -2089,7 +2304,7 @@ impl fmt::Display for ArrayLiteralExpr {
     }
 }
 
-/// An array subscript expression: expr[index]
+/// An array subscript expression: `expr[index]`
 #[derive(Debug, Clone)]
 pub struct ArraySubscriptExpr {
     pub array: Expr,
@@ -2124,6 +2339,19 @@ mod tests {
         assert_eq!(Literal::Text("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(Literal::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
+    }
+
+    #[test]
+    fn nested_minus_does_not_start_a_comment() {
+        let expr = Expr::UnaryOp(Box::new(UnaryOpExpr {
+            op: UnaryOp::Neg,
+            operand: Expr::UnaryOp(Box::new(UnaryOpExpr {
+                op: UnaryOp::Neg,
+                operand: Expr::Literal(Literal::Integer(1)),
+            })),
+        }));
+
+        assert_eq!(expr.to_string(), "- - 1");
     }
 
     #[test]
@@ -2194,12 +2422,14 @@ mod tests {
             }),
             joins: vec![JoinClause {
                 join_type: JoinType::Inner,
+                natural: false,
                 table: "orders".to_string(),
                 alias: Some("o".to_string()),
                 constraint: Some(JoinConstraint::On(Expr::ColumnRef(ColumnRef {
                     table: Some("u".to_string()),
                     column: "id".to_string(),
                 }))),
+                closed_groups: vec![],
             }],
             where_clause: None,
             group_by: None,
@@ -2212,6 +2442,48 @@ mod tests {
         assert_eq!(
             select.to_string(),
             "SELECT * FROM users AS u JOIN orders AS o ON u.id"
+        );
+    }
+
+    #[test]
+    fn select_displays_right_full_natural_and_using() {
+        let select = SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "a".to_string(),
+                alias: None,
+            }),
+            joins: vec![
+                JoinClause {
+                    join_type: JoinType::Right,
+                    natural: false,
+                    table: "b".to_string(),
+                    alias: None,
+                    constraint: Some(JoinConstraint::Using(vec!["x".to_string()])),
+                    closed_groups: vec![],
+                },
+                JoinClause {
+                    join_type: JoinType::Full,
+                    natural: true,
+                    table: "c".to_string(),
+                    alias: None,
+                    constraint: None,
+                    closed_groups: vec![],
+                },
+            ],
+            where_clause: None,
+            group_by: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(
+            select.to_string(),
+            "SELECT * FROM a RIGHT JOIN b USING (x) NATURAL FULL JOIN c"
         );
     }
 
@@ -2232,6 +2504,69 @@ mod tests {
         assert_eq!(
             insert.to_string(),
             "INSERT INTO users (name, age) VALUES ('Alice', 30)"
+        );
+    }
+
+    #[test]
+    fn update_from_not_indexed_display() {
+        let mut ctx = Context::new_with_seed(42);
+        let stmt = UpdateStmt {
+            with_clause: None,
+            table: "t".to_string(),
+            alias: None,
+            sets: vec![(
+                "v".to_string(),
+                Expr::literal(&mut ctx, Literal::Integer(1)),
+            )],
+            from: Some(FromClause {
+                table: "s".to_string(),
+                alias: None,
+            }),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                natural: false,
+                table: "j".to_string(),
+                alias: None,
+                constraint: None,
+                closed_groups: vec![],
+            }],
+            where_clause: None,
+            conflict: None,
+            returning: None,
+            not_indexed: true,
+        };
+        assert_eq!(
+            stmt.to_string(),
+            "UPDATE t NOT INDEXED SET v = 1 FROM s NOT INDEXED JOIN j NOT INDEXED"
+        );
+    }
+
+    #[test]
+    fn update_from_not_indexed_skips_subquery_source() {
+        let mut ctx = Context::new_with_seed(42);
+        // NOT INDEXED is not valid on a subquery source, so it must be omitted
+        // there while still applying to the real target table.
+        let stmt = UpdateStmt {
+            with_clause: None,
+            table: "t".to_string(),
+            alias: None,
+            sets: vec![(
+                "v".to_string(),
+                Expr::literal(&mut ctx, Literal::Integer(1)),
+            )],
+            from: Some(FromClause {
+                table: "(SELECT k FROM s)".to_string(),
+                alias: Some("x".to_string()),
+            }),
+            joins: vec![],
+            where_clause: None,
+            conflict: None,
+            returning: None,
+            not_indexed: true,
+        };
+        assert_eq!(
+            stmt.to_string(),
+            "UPDATE t NOT INDEXED SET v = 1 FROM (SELECT k FROM s) AS x"
         );
     }
 

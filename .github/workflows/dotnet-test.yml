@@ -7,8 +7,6 @@ on:
     tags:
       - v*
   pull_request:
-    branches:
-      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
@@ -21,7 +19,7 @@ env:
 
 jobs:
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     defaults:

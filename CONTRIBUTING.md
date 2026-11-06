@@ -288,6 +288,14 @@ Or using `choco` on Windows:
 choco install sqlite
 ```
 
+The Rust C compatibility tests also require a static SQLite installation from
+[vcpkg](https://github.com/microsoft/vcpkg):
+
+```powershell
+$env:VCPKG_ROOT = "C:\path\to\vcpkg"
+vcpkg install sqlite3:x64-windows-static-md
+```
+
 ### Running the tests
 To run the test suite with Turso, simply run:
 
@@ -305,16 +313,16 @@ When working on a new feature, please consider adding a test case for it.
 
 ## SQL Test Runner
 
-The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
-Tests should be added to `testing/sqltests/tests/` using the `.sqltest` format.
+The `sqltest` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+Tests should be added to `sqlite/conformance/sqlite-sqltests/` using the `.sqltest` format.
 
 To run tests:
 
 ```console
-make -C testing/sqltests run
+make -C sqlite/conformance run
 ```
 
-For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/sqltests/docs/).
+For full documentation on the DSL syntax and CLI usage, see the [sqltest docs](testing/sqltest/docs/).
 
 ## TPC-H
 
@@ -434,6 +442,15 @@ testing (DST) tool for the following:
 
 - Discovering bugs that the DST did not catch (and improve the DST)
 - Discovering bugs that the DST does not cover (for example, non-simulated I/O)
+
+The test templates live in `testing/antithesis/`. You can run one locally, without an Antithesis account, with
+[`thesis`](tools/thesis):
+
+```bash
+uv run --group antithesis thesis run testing/antithesis/stress-composer --seed 42
+```
+
+See [`testing/antithesis/README.md`](testing/antithesis/README.md#running-a-template-locally) for details.
 
 If you have an Antithesis account, you first need to configure some
 environment variables:

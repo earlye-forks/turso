@@ -7,7 +7,10 @@
 use crate::Schema;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
+use crate::functions::{
+    AGGREGATE_FUNCTIONS, FunctionCategory, FunctionDef, SCALAR_FUNCTIONS,
+    aggregate_result_depends_on_input_order,
+};
 use crate::trace::StmtKind;
 
 /// Runtime policy controlling generation weights and limits.
@@ -974,12 +977,25 @@ pub struct JoinConfig {
     /// Weights for choosing which type of JOIN to generate.
     pub join_type_weights: JoinTypeWeights,
 
-    /// Probability that a JOIN ON condition uses an equi-join
-    /// (`left.col = right.col`) rather than a general expression.
+    /// Probability that NATURAL modifies a non-CROSS join [0.0, 1.0].
+    pub natural_join_probability: f64,
+
+    /// Probability that a non-NATURAL join has ON or USING [0.0, 1.0].
+    pub join_constraint_probability: f64,
+
+    /// Probability that a join constraint uses USING when columns permit it.
+    pub using_probability: f64,
+
+    /// Probability that a JOIN ON condition uses `left.col = right.col`.
+    /// Other conditions compare these columns with a non-equality operator.
     pub equi_join_probability: f64,
 
     /// Probability of joining the same table again (self-join).
     pub self_join_probability: f64,
+
+    /// Probability of wrapping the FROM table and some of the joins after it
+    /// in parentheses, as in `(t1 JOIN t2 ON ...) AS g JOIN t3 ON ...`.
+    pub parenthesized_group_probability: f64,
 }
 
 impl Default for JoinConfig {
@@ -988,8 +1004,12 @@ impl Default for JoinConfig {
             join_probability: 0.0,
             max_joins: 2,
             join_type_weights: JoinTypeWeights::default(),
+            natural_join_probability: 0.15,
+            join_constraint_probability: 0.9,
+            using_probability: 0.25,
             equi_join_probability: 0.7,
             self_join_probability: 0.15,
+            parenthesized_group_probability: 0.0,
         }
     }
 }
@@ -999,8 +1019,9 @@ impl Default for JoinConfig {
 pub struct JoinTypeWeights {
     pub inner: u32,
     pub left: u32,
+    pub right: u32,
+    pub full: u32,
     pub cross: u32,
-    pub natural: u32,
 }
 
 impl Default for JoinTypeWeights {
@@ -1008,8 +1029,9 @@ impl Default for JoinTypeWeights {
         Self {
             inner: 40,
             left: 30,
+            right: 30,
+            full: 30,
             cross: 15,
-            natural: 15,
         }
     }
 }
@@ -1062,6 +1084,27 @@ impl Default for CteMaterializationWeights {
 // =============================================================================
 // SELECT Configuration
 // =============================================================================
+
+/// Window-frame syntax the generator may emit.
+///
+/// Keep this aligned with the frame modes accepted by the planner so the
+/// differential fuzzer does not spend its budget on intentionally rejected
+/// statements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowFramePolicy {
+    /// Generate built-in window functions without an explicit frame.
+    #[default]
+    CoercedOnly,
+    /// Generate aggregate window functions over any valid `ROWS` frame.
+    Rows,
+    /// Also generate all `GROUPS` frames and offset-free `RANGE` frames.
+    GroupsAndOffsetFreeRange,
+    /// Also generate numeric-offset `RANGE` frames.
+    RangeOffsets,
+    /// Also generate every explicit frame-exclusion variant while retaining
+    /// unexcluded frames for xInverse coverage.
+    Exclude,
+}
 
 /// Configuration for SELECT statement generation.
 #[derive(Debug, Clone)]
@@ -1121,6 +1164,14 @@ pub struct SelectConfig {
     /// Probability of WHERE clause in simple/subquery SELECT.
     pub subquery_where_probability: f64,
 
+    /// Probability that a subquery adds an equality to a compatible column
+    /// from its immediately enclosing SELECT.
+    pub subquery_correlation_probability: f64,
+
+    /// Probability that a scalar subquery without GROUP BY returns one
+    /// aggregate row instead of selecting one input row with LIMIT 1.
+    pub subquery_aggregate_probability: f64,
+
     /// Order direction weights.
     pub order_direction_weights: OrderDirectionWeights,
 
@@ -1175,6 +1226,17 @@ pub struct SelectConfig {
     /// Weights for compound operator selection.
     pub compound_operator_weights: CompoundOperatorWeights,
 
+    /// Probability that each expression-list result column is generated
+    /// as a window function (`func(...) OVER (...)`) rather than a
+    /// generic expression. 0.0 disables window-function generation in
+    /// the SELECT list. Window functions live outside the recursive
+    /// expression dispatch, so this gate keeps them out of WHERE /
+    /// HAVING / function args / subqueries.
+    pub window_function_probability: f64,
+
+    /// Highest window-frame feature set the generator may use.
+    pub window_frame_policy: WindowFramePolicy,
+
     // Stubs (not yet implemented, probability 0.0)
     /// Probability of generating a derived table (subquery in FROM).
     pub derived_table_probability: f64,
@@ -1201,6 +1263,8 @@ impl Default for SelectConfig {
             column_alias_probability: 0.2,
             max_offset: 100,
             subquery_where_probability: 0.5,
+            subquery_correlation_probability: 0.0,
+            subquery_aggregate_probability: 0.0,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),
             order_by_column_weight: 6,
@@ -1220,6 +1284,11 @@ impl Default for SelectConfig {
             compound_operator_weights: CompoundOperatorWeights::default(),
             // Stubs
             derived_table_probability: 0.0,
+            // Off by default — the differential fuzzer's window_fuzzer
+            // mode and any explicit window-function test should set
+            // this themselves.
+            window_function_probability: 0.0,
+            window_frame_policy: WindowFramePolicy::CoercedOnly,
         }
     }
 }
@@ -2041,10 +2110,13 @@ impl Default for CompoundOpWeights {
 /// Configuration for function call generation.
 #[derive(Debug, Clone)]
 pub struct FunctionConfig {
-    /// Available functions with their weights. Functions with weight 0 are disabled.
+    /// Available scalar functions with their weights. A weight of 0 disables a function.
     pub function_weights: Vec<(&'static FunctionDef, u32)>,
+    /// Available aggregate functions with their weights.
+    pub aggregate_function_weights: Vec<(&'static FunctionDef, u32)>,
     /// Whether to only use deterministic functions.
     pub deterministic_only: bool,
+    pub allow_order_dependent_aggregates: bool,
     /// Category weights for selecting function categories.
     pub category_weights: FunctionCategoryWeights,
 }
@@ -2064,7 +2136,9 @@ impl Default for FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2085,7 +2159,9 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2104,7 +2180,9 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2125,14 +2203,25 @@ impl FunctionConfig {
                     (f, weight)
                 })
                 .collect(),
+            aggregate_function_weights: default_aggregate_function_weights(),
             deterministic_only: true,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
 
+    pub fn without_order_dependent_aggregates(mut self) -> Self {
+        self.allow_order_dependent_aggregates = false;
+        self
+    }
+
     /// Disable specific functions by name (sets their weight to 0).
     pub fn disable(mut self, names: &[&str]) -> Self {
-        for (f, w) in &mut self.function_weights {
+        let all_weights = self
+            .function_weights
+            .iter_mut()
+            .chain(&mut self.aggregate_function_weights);
+        for (f, w) in all_weights {
             if names.contains(&f.name) {
                 *w = 0;
             }
@@ -2142,7 +2231,11 @@ impl FunctionConfig {
 
     /// Enable all functions in a category (sets their weight to 10).
     pub fn enable_category(mut self, category: FunctionCategory) -> Self {
-        for (f, w) in &mut self.function_weights {
+        let all_weights = self
+            .function_weights
+            .iter_mut()
+            .chain(&mut self.aggregate_function_weights);
+        for (f, w) in all_weights {
             if f.category == category {
                 *w = 10;
             }
@@ -2157,21 +2250,70 @@ impl FunctionConfig {
             .iter()
             .filter(|(f, w)| *w > 0 && (!self.deterministic_only || f.is_deterministic))
             .collect();
-
-        if eligible.is_empty() {
-            return Err(GenError::exhausted(
-                "function_call",
-                "no functions configured or all have zero weight",
-            ));
-        }
-
-        let weights: Vec<u32> = eligible.iter().map(|(_, w)| *w).collect();
-        let idx = ctx.weighted_index(&weights).ok_or_else(|| {
-            GenError::exhausted("function_call", "all functions have zero weight")
-        })?;
-
-        Ok(eligible[idx].0)
+        choose_weighted_function(
+            ctx,
+            &eligible,
+            "function_call",
+            "no functions configured or all have zero weight",
+        )
     }
+
+    /// Select an aggregate function based on weights.
+    pub fn select_aggregate_function(
+        &self,
+        ctx: &mut Context,
+    ) -> Result<&'static FunctionDef, GenError> {
+        let eligible: Vec<_> = self
+            .aggregate_function_weights
+            .iter()
+            .filter(|(f, w)| {
+                *w > 0
+                    && (!self.deterministic_only || f.is_deterministic)
+                    && (self.allow_order_dependent_aggregates
+                        || !aggregate_result_depends_on_input_order(f.name))
+            })
+            .collect();
+        choose_weighted_function(
+            ctx,
+            &eligible,
+            "aggregate_function_call",
+            "no aggregate functions configured or all have zero weight",
+        )
+    }
+}
+
+fn choose_weighted_function(
+    ctx: &mut Context,
+    eligible: &[&(&'static FunctionDef, u32)],
+    scope: &str,
+    empty_reason: &str,
+) -> Result<&'static FunctionDef, GenError> {
+    if eligible.is_empty() {
+        return Err(GenError::exhausted(scope, empty_reason));
+    }
+
+    let weights: Vec<u32> = eligible.iter().map(|(_, w)| *w).collect();
+    let idx = ctx
+        .weighted_index(&weights)
+        .ok_or_else(|| GenError::exhausted(scope, "all functions have zero weight"))?;
+
+    Ok(eligible[idx].0)
+}
+
+/// Give each SQLite aggregate the same starting weight. Array aggregates stay
+/// disabled because SQLite does not support them.
+fn default_aggregate_function_weights() -> Vec<(&'static FunctionDef, u32)> {
+    AGGREGATE_FUNCTIONS
+        .iter()
+        .map(|function| {
+            let weight = if function.category == FunctionCategory::Array {
+                0
+            } else {
+                10
+            };
+            (function, weight)
+        })
+        .collect()
 }
 
 /// Weights for function categories.

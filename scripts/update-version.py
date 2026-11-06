@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Script to update version in Cargo.toml, package.json, package-lock.json,
-gradle.properties, and Directory.Build.props files for the Turso project.
-This script updates all occurrences of the version in the workspace configuration,
-updates the JavaScript and WebAssembly bindings package.json and package-lock.json files,
-updates the Java bindings gradle.properties file, updates the .NET bindings
-Directory.Build.props file,
-uses cargo update to update Cargo.lock, creates a git commit, and adds a version tag.
+Script to update version in workspace Cargo manifests, package.json,
+package-lock.json, gradle.properties, and Directory.Build.props files for the
+Turso project. This script updates all occurrences of the version in the
+workspace configuration, updates the JavaScript and WebAssembly bindings
+package.json and package-lock.json files, updates the Java bindings
+gradle.properties file, updates the .NET bindings Directory.Build.props file,
+uses cargo update to update Cargo.lock, creates a git commit, and adds a
+version tag.
 """
 
 import argparse
@@ -15,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 # Define all npm package paths in one place
@@ -53,6 +55,14 @@ NPM_WORKSPACES = [
 
 JAVA_GRADLE_PROPERTIES = "bindings/java/gradle.properties"
 DOTNET_DIRECTORY_BUILD_PROPS = "bindings/dotnet/Directory.Build.props"
+
+
+def iter_cargo_toml_files():
+    """Yield all Cargo.toml manifests in the repo, excluding build output."""
+    for path in sorted(Path(".").rglob("Cargo.toml")):
+        if "target" in path.parts:
+            continue
+        yield path
 
 
 def parse_args():
@@ -94,9 +104,26 @@ def update_cargo_toml(new_version):
 
         current_version = extract_current_version(content)
 
-        # Pattern to match version in various contexts while maintaining the quotes
         pattern = r'(version\s*=\s*)"' + re.escape(current_version) + r'"'
-        updated_content = re.sub(pattern, rf'\1"{new_version}"', content)
+        workspace = tomllib.loads(content)["workspace"]
+        sections = re.split(r"(?m)^(\[[^\n]+\][ \t]*\n)", content)
+        for index in range(1, len(sections), 2):
+            section = sections[index].strip()
+            body = sections[index + 1]
+            if section == "[workspace.package]":
+                body = re.sub(pattern, rf'\1"{new_version}"', body, count=1)
+            elif section == "[workspace.dependencies]":
+                for name, dependency in workspace["dependencies"].items():
+                    if not isinstance(dependency, dict) or "path" not in dependency:
+                        continue
+                    entry_pattern = rf"(?m)^{re.escape(name)}\s*=\s*\{{[^}}]*\}}"
+                    body = re.sub(
+                        entry_pattern,
+                        lambda match: re.sub(pattern, rf'\1"{new_version}"', match[0]),
+                        body,
+                    )
+            sections[index + 1] = body
+        updated_content = "".join(sections)
 
         cargo_path.write_text(updated_content)
         return True
@@ -171,16 +198,6 @@ def update_package_json(dir_path, new_version):  # noqa: C901
     except Exception:
         return False
 
-def run_npm_install(path):
-    """Run npm install to update package-lock.json"""
-    try:
-        # Run cargo update showing its output with verbose flag
-        print(f"Info: run npm install at path {path}")
-        subprocess.run(["npm", "install"], check=True, cwd=path)
-        return True
-    except Exception:
-        return False
-
 def run_yarn_install(path):
     """Run yarn install to update yarn-lock.json"""
     try:
@@ -193,14 +210,15 @@ def run_yarn_install(path):
 
 def update_all_packages(new_version):
     """Update all npm packages with the new version."""
-    results = []
     for package_path in NPM_PACKAGES:
-        result = update_package_json(package_path, new_version)
-        results.append((package_path, result))
+        if not update_package_json(package_path, new_version):
+            print(f"Error updating {package_path}", file=sys.stderr)
+            return False
     for workspace_path in NPM_WORKSPACES:
-        run_npm_install(workspace_path)
-        run_yarn_install(workspace_path)
-    return results
+        if not run_yarn_install(workspace_path):
+            print(f"Error installing {workspace_path}", file=sys.stderr)
+            return False
+    return True
 
 
 def update_gradle_properties(new_version):
@@ -268,7 +286,8 @@ def create_git_commit_and_tag(version):
     """Create a git commit with all changes and add a version tag."""
     try:
         # Add files that exist and have changes
-        files_to_add = ["Cargo.toml", "Cargo.lock"]
+        files_to_add = [str(path) for path in iter_cargo_toml_files()]
+        files_to_add.append("Cargo.lock")
 
         # Add Java gradle.properties if it exists
         if os.path.exists(JAVA_GRADLE_PROPERTIES):
@@ -293,10 +312,7 @@ def create_git_commit_and_tag(version):
 
         # Add each file individually
         for file in files_to_add:
-            try:
-                subprocess.run(["git", "add", file], check=True)
-            except subprocess.CalledProcessError:
-                print(f"Warning: Could not add {file} to git")
+            subprocess.run(["git", "add", file], check=True)
 
         # Create commit
         commit_message = f"Turso {version}"
@@ -316,23 +332,18 @@ def main():
     args = parse_args()
     new_version = args.version
 
-    # Update Cargo.toml
-    update_cargo_toml(new_version)
-
-    # Update all npm packages
-    update_all_packages(new_version)
-
-    # Update Java gradle.properties
-    update_gradle_properties(new_version)
-
-    # Update .NET Directory.Build.props
-    update_dotnet_props(new_version)
-
-    # Update Cargo.lock using cargo update
-    run_cargo_update()
-
-    # Create git commit and tag
-    create_git_commit_and_tag(new_version)
+    if not update_cargo_toml(new_version):
+        sys.exit("Error updating Cargo.toml")
+    if not update_all_packages(new_version):
+        sys.exit("Error updating npm packages")
+    if not update_gradle_properties(new_version):
+        sys.exit("Error updating Java version")
+    if not update_dotnet_props(new_version):
+        sys.exit("Error updating .NET version")
+    if not run_cargo_update():
+        sys.exit("Error updating Cargo.lock")
+    if not create_git_commit_and_tag(new_version):
+        sys.exit("Error creating version commit and tag")
 
 
 if __name__ == "__main__":

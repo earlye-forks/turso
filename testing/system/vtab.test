@@ -23,17 +23,17 @@ load_extension test_ext
 do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-1 {
     CREATE VIRTUAL TABLE t1 USING kv_store;
     CREATE VIRTUAL TABLE t1 USING kv_store;
-} {Table t1 already exists}
+} {table t1 already exists}
 
 do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-2 {
     CREATE TABLE t2 (col INTEGER);
     CREATE VIRTUAL TABLE t2 USING kv_store;
-} {Table t2 already exists}
+} {table t2 already exists}
 
 do_execsql_test_in_memory_error_content create-virtual-table-duplicate-name-3 {
     CREATE VIRTUAL TABLE t3 USING kv_store;
     CREATE TABLE t3 (col INTEGER);
-} {Table t3 already exists}
+} {table t3 already exists}
 
 do_execsql_test_on_specific_db {:memory:} create-virtual-table-if-not-exists-1 {
     CREATE TABLE t2 (col INTEGER);
@@ -134,6 +134,16 @@ do_execsql_test_on_specific_db {:memory:} update-hidden-column {
     update t set comment = 'updated comment' where key = 'hidden';
     select comment from t where key = 'hidden';
 } {"updated comment"}
+
+do_execsql_test_on_specific_db {:memory:} delete-all-rows-without-a-where-clause {
+    create virtual table t using kv_store;
+    insert into t(key, value) values ('k0', 'v0'), ('k1', 'v1'), ('k2', 'v2');
+    delete from t;
+    select count(*) from t;
+    insert into t(key, value) values ('k3', 'v3');
+    select key, value from t;
+} {0
+k3|v3}
 
 # hidden columns are not listed in the dataset returned by 'PRAGMA table_info'
 do_execsql_test_on_specific_db {:memory:} pragma-table-info-hidden-columns {
@@ -432,4 +442,4 @@ do_execsql_test tvf-args-from-another-tvf {
 
 do_execsql_test_error tvf-circular-column-references {
     SELECT * FROM generate_series(a.start, a.stop) b, generate_series(b.start, b.stop) a;
-} {No valid query plan found|no query solution}
+} {no query solution}

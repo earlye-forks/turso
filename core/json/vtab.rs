@@ -206,7 +206,7 @@ impl JsonEachCursor {
     fn empty(traversal_mode: JsonTraversalMode) -> Self {
         Self {
             rowid: 0,
-            json: Jsonb::new(0, None),
+            json: Jsonb::empty(),
             traversal_states: Vec::new(),
             path_to_current_value: InPlaceJsonPath::new_root(),
             columns: Columns::default(),
@@ -253,7 +253,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.traversal_states.clear();
         self.rowid = 0;
 
-        if args.is_empty() {
+        if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
         }
         if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
@@ -348,7 +348,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
         match traversal_state.iterator_state {
             IteratorState::Array(state) => {
-                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state) else {
+                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state)? else {
                     self.path_to_current_value.pop();
                     return self.next();
                 };
@@ -385,7 +385,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 }
             }
             IteratorState::Object(state) => {
-                let Some(((_idx, key, value), new_state)) = self.json.object_iterator_next(&state)
+                let Some(((_idx, key, value), new_state)) =
+                    self.json.object_iterator_next(&state)?
                 else {
                     self.path_to_current_value.pop();
                     return self.next();
@@ -429,7 +430,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     key,
                     jsonb,
                     self.path_to_current_value.string.clone(),
-                    parent_id,
+                    None,
                     self.path_to_current_value
                         .read(traversal_state.innermost_container_cursor)
                         .to_owned(),
@@ -493,7 +494,7 @@ fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, Li
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2);
+    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
     if jsonb
         .operate_on_path(&json_path, &mut search_operation)
         .is_err()
@@ -547,7 +548,7 @@ mod columns {
         fn default() -> Columns {
             Self {
                 key: Key::empty(),
-                value: Jsonb::new(0, None),
+                value: Jsonb::empty(),
                 fullkey: "".to_owned(),
                 parent_id: None,
                 innermost_container_path: "".to_owned(),
@@ -603,15 +604,11 @@ mod columns {
                 jsonb::ElementType::TEXT
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => {
-                    let s = value.to_string()?;
-                    // Text values must be properly quoted
-                    let unquoted = s
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-                    Ok(Value::Text(Text::new(unquoted.to_string())))
-                }
+                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
+                    value.clone(),
+                    element_type,
+                    OutputVariant::ElementTypePlain,
+                ),
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
                 jsonb::ElementType::RESERVED1 => Ok(Value::Null),
@@ -714,14 +711,14 @@ impl InPlaceJsonPath {
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
 
-        let unquoted_if_necessary = if inner
-            .chars()
-            .any(|c| c == '.' || c == ' ' || c == '"' || c == '_')
-        {
-            key
-        } else {
-            inner
+        let mut chars = inner.chars();
+        let needs_quotes = match chars.next() {
+            None => true,
+            Some(first) => {
+                !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
+            }
         };
+        let unquoted_if_necessary = if needs_quotes { key } else { inner };
         self.last_element = Key::String(inner.to_owned());
         self.push(format!(".{unquoted_if_necessary}"));
         Ok(())
@@ -778,7 +775,8 @@ impl InPlaceJsonPath {
     fn element_length(element: &PathElement) -> usize {
         match element {
             PathElement::Root() => 1,
-            PathElement::Key(key, _) => key.len() + 1,
+            PathElement::Key(key, true) => key.len() + 3,
+            PathElement::Key(key, false) => key.len() + 1,
             PathElement::ArrayLocator(idx) => {
                 let digit_count = successors(*idx, |&n| (n >= 10).then_some(n / 10)).count();
                 let bracket_count = 2; // []

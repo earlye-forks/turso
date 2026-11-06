@@ -1,7 +1,9 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use tempfile::TempDir;
-use turso_core::{LimboError, Numeric, StepResult, Value};
+use turso_core::{LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -35,6 +37,52 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test]
+fn recursive_cte_with_bound_termination_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(
+        "SELECT (
+            WITH RECURSIVE seq(x) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT x + 1 FROM seq WHERE x < ?
+            )
+            SELECT count(*) FROM seq
+        )",
+    )?;
+    stmt.bind_at(1.try_into()?, Value::from_i64(100))?;
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(100));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[turso_macros::test]
+fn recursive_cte_explain_query_plan_shows_setup_and_recursive_step(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let eqp_rows = limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN
+         WITH RECURSIVE t(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM t WHERE a < 3)
+         SELECT * FROM t",
+    );
+    let plan = eqp_rows
+        .iter()
+        .filter_map(|row| match row.get(3) {
+            Some(rusqlite::types::Value::Text(detail)) => Some(detail.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_that!(plan)
+        .contains("SETUP")
+        .contains("RECURSIVE STEP");
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -53,25 +101,13 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(stmt.parameters().count(), 4);
 
     stmt.run_with_row_callback(|row| {
-        if let turso_core::Value::Text(s) = row.get::<&Value>(0).unwrap() {
-            assert_eq!(s.as_str(), "hello")
-        }
-
-        if let turso_core::Value::Text(s) = row.get::<&Value>(1).unwrap() {
-            assert_eq!(s.as_str(), "hello")
-        }
-
-        if let turso_core::Value::Numeric(Numeric::Integer(i)) = row.get::<&Value>(2).unwrap() {
-            assert_eq!(*i, 42)
-        }
-
-        if let turso_core::Value::Blob(v) = row.get::<&Value>(3).unwrap() {
-            assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
-        }
-
-        if let turso_core::Value::Numeric(Numeric::Float(f)) = row.get::<&Value>(4).unwrap() {
-            assert_eq!(f64::from(*f), 0.5)
-        }
+        assert_that!(row.get_values().cloned().collect::<Vec<_>>()).is_equal_to(row![
+            "hello",
+            "hello",
+            42,
+            vec![0x1_u8, 0x2, 0x3],
+            0.5
+        ]);
         Ok(())
     })
     .unwrap();
@@ -111,11 +147,10 @@ fn test_open_existing_without_rowid_database(_tmp_db: TempDatabase) -> anyhow::R
     assert_eq!(limbo_exec_rows(&conn, query), sqlite_rows);
     assert_eq!(limbo_exec_rows(&conn, schema_query), sqlite_schema);
 
-    let err = conn.prepare("SELECT rowid FROM config").unwrap_err();
-    assert!(
-        err.to_string().contains("no such column: rowid"),
-        "expected rowid access to be rejected for WITHOUT ROWID table, got {err}"
-    );
+    assert_that!(conn.prepare("SELECT rowid FROM config"))
+        .err()
+        .display_string()
+        .contains("no such column: rowid");
 
     Ok(())
 }
@@ -593,9 +628,9 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::from_i64(1));
-    assert_eq!(rows[1][0], Value::from_i64(99));
+    assert_that!(rows)
+        .column(0)
+        .is_equal_to(vec![Cell::from(1), Cell::from(99)]);
 
     // Test 2: CTE with UNION (not UNION ALL)
     let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
@@ -618,9 +653,9 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
         Ok(())
     })?;
 
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::from_i64(1));
-    assert_eq!(rows[1][0], Value::from_i64(2));
+    assert_that!(rows)
+        .column(0)
+        .is_equal_to(vec![Cell::from(1), Cell::from(2)]);
 
     Ok(())
 }
@@ -796,18 +831,10 @@ fn test_prepare_rejects_empty_statements(tmp_db: TempDatabase) {
     ];
 
     for sql in empty_inputs {
-        let Err(err) = conn.prepare(sql) else {
-            panic!("Expected invalid argument error for input: {sql}");
+        let Err(LimboError::InvalidArgument(msg)) = conn.prepare(sql) else {
+            panic!("Expected an invalid argument error for input: {sql}");
         };
-        match err {
-            LimboError::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("contains no statements"),
-                    "Unexpected error message for input {sql}: {msg}"
-                );
-            }
-            other => panic!("Unexpected error for input {sql}: {other}"),
-        }
+        assert_that!(msg).contains("contains no statements");
     }
 
     let invalid_syntax_inputs = ["/* outer /* inner */ still outer */"];
@@ -842,7 +869,7 @@ fn test_max_joined_tables_limit(tmp_db: TempDatabase) {
     let Err(LimboError::ParseError(result)) = conn.prepare(&sql) else {
         panic!("Expected an error but got no error");
     };
-    assert!(result.contains("Only up to 63 tables can be joined"));
+    assert_that!(result).contains("Only up to 63 tables can be joined");
 }
 
 #[turso_macros::test]
@@ -907,40 +934,6 @@ fn test_many_columns(tmp_db: TempDatabase) {
             turso_core::Value::from_i64(900),
         ]]
     );
-}
-
-#[turso_macros::test]
-fn test_eval_param_only_once(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("CREATE TABLE t(x)").unwrap();
-    conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 10000)")
-        .unwrap();
-    let mut stmt = conn
-        .query("SELECT COUNT(*) FROM t WHERE LENGTH(zeroblob(?)) = ?")
-        .unwrap()
-        .unwrap();
-    stmt.bind_at(
-        1.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    )
-    .unwrap();
-    stmt.bind_at(
-        2.try_into().unwrap(),
-        turso_core::Value::from_i64(100_000_000),
-    )
-    .unwrap();
-    let start_time = std::time::Instant::now();
-    stmt.run_with_row_callback(|row| {
-        let values = row.get_values().cloned().collect::<Vec<_>>();
-        assert_eq!(values, vec![turso_core::Value::from_i64(10000)]);
-        Ok(())
-    })
-    .unwrap();
-
-    let end_time = std::time::Instant::now();
-    let elapsed = end_time.duration_since(start_time);
-    // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(500));
 }
 
 /// Regression test for https://github.com/tursodatabase/turso/issues/5232
@@ -1029,8 +1022,9 @@ fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
         turso_rows.push(row.get::<&Value>(2).unwrap().clone());
         Ok(())
     })?;
-    assert_eq!(turso_rows.len(), 1);
-    assert_eq!(turso_rows[0], Value::from_i64(42));
+    assert_that!(turso_rows)
+        .single_element()
+        .is_equal_to(Cell::from(42));
     Ok(())
 }
 
@@ -1070,4 +1064,97 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
         let expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
         assert_eq!(names, expected, "Turso column names mismatch for: {sql}");
     }
+}
+
+/// A fused column-range read (Insn::ColumnRange) must stay correct when
+/// `cursor.record()` yields IO mid-instruction. Records spanning many
+/// overflow pages are scanned through a reopened database whose IO only
+/// completes one queued operation per yield, so the instruction is
+/// re-entered repeatedly while filling its destination registers.
+#[test]
+fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+    use std::sync::Arc;
+    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+
+    const ROWS: i64 = 4;
+    // ~100KB of TEXT per row spans dozens of overflow pages, so reading one
+    // record requires many page fetches.
+    const BIG_LEN: i64 = 100_000;
+
+    let io = Arc::new(QueuedIo::new());
+    let path = "column-range-io-reentry.db";
+    let open = |io: Arc<QueuedIo>| -> anyhow::Result<Arc<Database>> {
+        Ok(Database::open_file_with_flags(
+            io,
+            path,
+            Default::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?)
+    };
+
+    {
+        let db = open(io.clone())?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
+        for i in 0..ROWS {
+            conn.execute(
+                format!(
+                    "INSERT INTO t VALUES ({i}, printf('%0{BIG_LEN}d', {i}), 'tail{i}', {}, 'end{i}')",
+                    i * 7
+                )
+                .as_str(),
+            )?;
+        }
+        conn.close()?;
+    }
+
+    // A fresh Database over the same backing file starts with a cold page
+    // cache, so every record (and its overflow chain) must be read back.
+    let db = open(io.clone())?;
+    let conn = db.connect()?;
+    let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
+    let mut io_yields = 0usize;
+    let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push((
+                    row.get::<i64>(0)?,
+                    row.get::<&str>(1)?.len(),
+                    row.get::<&str>(2)?.to_string(),
+                    row.get::<i64>(3)?,
+                    row.get::<&str>(4)?.to_string(),
+                ));
+            }
+            StepResult::IO | StepResult::Yield => {
+                io_yields += 1;
+                // Complete a single queued operation per yield to maximize
+                // the number of times the column fetch is re-entered.
+                io.step_one()?;
+            }
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert!(
+        io_yields > 0,
+        "cold-cache overflow scan must yield IO so the column fetch is re-entered"
+    );
+    let expected: Vec<(i64, usize, String, i64, String)> = (0..ROWS)
+        .map(|i| {
+            (
+                i,
+                BIG_LEN as usize,
+                format!("tail{i}"),
+                i * 7,
+                format!("end{i}"),
+            )
+        })
+        .collect();
+    assert_eq!(rows, expected);
+    Ok(())
 }

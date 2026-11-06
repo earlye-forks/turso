@@ -1,6 +1,7 @@
-use crate::{alloc, turso_assert, turso_assert_eq, turso_debug_assert, Result};
+use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
+use std::ops::Range;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -40,15 +41,15 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, PrepareContext,
-    PreparedProgram, Program,
+    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
+    PrepareContext, PreparedProgram, Program,
 };
+use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
 use std::num::NonZeroUsize;
 
-/// A key that uniquely identifies a cursor.
-/// The key is a pair of table reference id and index.
-/// The index is only provided when the cursor is an index cursor.
+/// Identifies the table source that a cursor reads.
+/// A temporary cursor can share this key. A cursor override selects that cursor.
 #[derive(Debug, Clone)]
 pub struct CursorKey {
     /// The table reference that the cursor is associated with.
@@ -58,7 +59,7 @@ pub struct CursorKey {
     ///  TableInternalIds are unique within a program, since there is one id per table reference.
     pub table_reference_id: TableInternalId,
     /// The index, in case of an index cursor.
-    /// The combination of table internal id and index is enough to disambiguate.
+    /// The table reference and index identify one logical index read.
     pub index: Option<Arc<Index>>,
     /// Whether this cursor is an special case build cursor.
     pub is_build: bool,
@@ -190,6 +191,42 @@ impl DmlColumnContext {
     }
 }
 
+enum BuilderQueryMode {
+    Normal,
+    Explain,
+    ExplainQueryPlan {
+        format: ast::EqpFormat,
+        current_parent_idx: Option<usize>,
+    },
+}
+
+impl BuilderQueryMode {
+    const fn new(query_mode: QueryMode) -> Self {
+        match query_mode {
+            QueryMode::Normal => Self::Normal,
+            QueryMode::Explain => Self::Explain,
+            QueryMode::ExplainQueryPlan { format } => Self::ExplainQueryPlan {
+                format,
+                current_parent_idx: None,
+            },
+        }
+    }
+
+    const fn query_mode(&self) -> QueryMode {
+        match self {
+            Self::Normal => QueryMode::Normal,
+            Self::Explain => QueryMode::Explain,
+            Self::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
+        }
+    }
+
+    const fn is_explain_query_plan(&self) -> bool {
+        matches!(self, Self::ExplainQueryPlan { .. })
+    }
+}
+
 pub struct ProgramBuilder {
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
     /// that are deemed to be compile-time constant and can be hoisted out of loops
@@ -206,8 +243,7 @@ pub struct ProgramBuilder {
     /// `anchor_offset + 1` so it tracks whichever instruction ends up at that
     /// position, even after `emit_constant_insns` reorders the program.
     label_to_resolved_offset: Vec<Option<InsnReference>>,
-    // map of instruction index to manual comment (used in EXPLAIN only)
-    comments: Vec<(InsnReference, &'static str)>,
+    explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -219,6 +255,10 @@ pub struct ProgramBuilder {
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
     ctes_being_defined: Vec<String>,
+    /// Stack of views currently being expanded, keyed by `(database_id, name)`
+    /// so a view is distinguished from a same-named view in another attached or
+    /// temp schema. Used to detect self-referential views.
+    views_being_expanded: Vec<(usize, String)>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
@@ -237,9 +277,9 @@ pub struct ProgramBuilder {
     write_database_cookies: HashMap<usize, u32>,
     /// Schema cookies for attached databases opened for reading.
     read_database_cookies: HashMap<usize, u32>,
-    /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
-    /// This allows for things like hash build to use a separate cursor for iterating the same table.
-    cursor_overrides: HashMap<usize, CursorID>,
+    /// Temporary cursor mappings for code that reads a source through a second cursor.
+    /// A later mapping takes priority, which permits nested translation scopes.
+    cursor_overrides: Vec<(CursorKey, CursorID)>,
     /// Maps identifier names to registers for custom type encode/decode expressions.
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
@@ -252,20 +292,20 @@ pub struct ProgramBuilder {
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
     /// The mode in which the query is being executed.
-    query_mode: QueryMode,
+    mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
+    free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
+    free_cursor_ids: Vec<usize>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
-    /// Current parent explain address, if any.
-    current_parent_explain_idx: Option<usize>,
     pub(crate) reg_result_cols_start: Option<usize>,
     pub resolve_type: ResolveType,
     /// When set, all triggers fired from this program should use this conflict resolution.
@@ -296,17 +336,18 @@ pub struct ProgramBuilder {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct ProgramBuilderFlags(u8);
+pub struct ProgramBuilderFlags(u16);
 
 impl ProgramBuilderFlags {
-    const ROLLBACK: u8 = 1 << 0;
-    const IS_MULTI_WRITE: u8 = 1 << 1;
-    const MAY_ABORT: u8 = 1 << 2;
-    const READONLY: u8 = 1 << 3;
-    const IS_SUBPROGRAM: u8 = 1 << 4;
-    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
-    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
-    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+    const ROLLBACK: u16 = 1 << 0;
+    const IS_MULTI_WRITE: u16 = 1 << 1;
+    const MAY_ABORT: u16 = 1 << 2;
+    const READONLY: u16 = 1 << 3;
+    const IS_SUBPROGRAM: u16 = 1 << 4;
+    const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
+    const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
+    const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -320,12 +361,12 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    const fn get(self, bit: u8) -> bool {
+    const fn get(self, bit: u16) -> bool {
         (self.0 & bit) != 0
     }
 
     #[inline]
-    const fn set(&mut self, bit: u8, value: bool) {
+    const fn set(&mut self, bit: u16, value: bool) {
         if value {
             self.0 |= bit;
         } else {
@@ -424,12 +465,17 @@ impl ProgramBuilderFlags {
     pub const fn set_suppress_column_default(&mut self, v: bool) {
         self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
     }
-}
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MaterializedBuildInputModeTag {
-    RowidOnly,
-    Payload,
+    /// Whether expression translation must ignore selected expression indexes.
+    pub const fn skip_expression_index_values(self) -> bool {
+        self.get(Self::SKIP_EXPRESSION_INDEX_VALUES)
+    }
+
+    /// Set this while an `IfNullRow` fallback computes the original expression,
+    /// as SQLite clears `pIdxEpr`, so the same index match does not recur.
+    pub const fn set_skip_expression_index_values(&mut self, value: bool) {
+        self.set(Self::SKIP_EXPRESSION_INDEX_VALUES, value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,8 +492,6 @@ pub struct HashBuildSignature {
     pub use_bloom_filter: bool,
     /// Rowid input cursor when the build side is materialized.
     pub materialized_input_cursor: Option<CursorID>,
-    /// RowidOnly vs KeyPayload
-    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 /// Information about a materialized CTE, used for sharing data across multiple references.
@@ -541,13 +585,15 @@ impl CursorType {
 pub enum QueryMode {
     Normal,
     Explain,
-    ExplainQueryPlan,
+    ExplainQueryPlan { format: ast::EqpFormat },
 }
 
 impl QueryMode {
     pub const fn new(cmd: &ast::Cmd) -> Self {
         match cmd {
-            ast::Cmd::ExplainQueryPlan(_) => QueryMode::ExplainQueryPlan,
+            ast::Cmd::ExplainQueryPlan { format, .. } => {
+                QueryMode::ExplainQueryPlan { format: *format }
+            }
             ast::Cmd::Explain(_) => QueryMode::Explain,
             ast::Cmd::Stmt(_) => QueryMode::Normal,
         }
@@ -576,12 +622,12 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid allocating a String if we are not in explain mode.
+/// because we want to avoid building the `EqpDetail` if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
-        if let $crate::QueryMode::ExplainQueryPlan = $builder.get_query_mode() {
-            $builder.emit_explain($push, $detail);
+        if let $crate::QueryMode::ExplainQueryPlan { .. } = $builder.get_query_mode() {
+            $builder.emit_explain_should_not_be_called_directly($push, $detail);
         }
     };
 }
@@ -596,6 +642,8 @@ impl ProgramBuilder {
             .expect("variable index must be non-zero");
         if let Some(name) = variable.name.as_deref() {
             self.parameters.push_named_at(name, index);
+        } else if variable.numbered {
+            self.parameters.push_numbered(index);
         } else {
             self.parameters.push_index(index);
         }
@@ -656,13 +704,15 @@ impl ProgramBuilder {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
+            free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
+            free_cursor_ids: Vec::new(),
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
-            comments: Vec::new(),
+            explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
@@ -678,15 +728,14 @@ impl ProgramBuilder {
             read_databases: BitSet::default(),
             write_database_cookies: HashMap::default(),
             read_database_cookies: HashMap::default(),
-            query_mode,
-            current_parent_explain_idx: None,
+            mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
-            cursor_overrides: HashMap::default(),
+            cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
@@ -694,6 +743,7 @@ impl ProgramBuilder {
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
+            views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
         }
@@ -750,15 +800,60 @@ impl ProgramBuilder {
         self.ctes_being_defined.iter().any(|n| n == name)
     }
 
-    /// Temporarily take the CTE-being-defined stack (e.g. during view
-    /// expansion, which should not see CTE context from the caller).
-    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ctes_being_defined)
+    /// Hide CTEs being defined whose names an inner WITH clause redefines:
+    /// the inner definitions shadow the outer names for that lexical scope,
+    /// so references to them are not circular. Returns the hidden names for
+    /// [Self::unmask_shadowed_ctes_being_defined].
+    pub fn mask_shadowed_ctes_being_defined(&mut self, shadowing_names: &[String]) -> Vec<String> {
+        let mut masked = Vec::new();
+        self.ctes_being_defined.retain(|name| {
+            if shadowing_names.contains(name) {
+                masked.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        masked
     }
 
-    /// Restore the CTE-being-defined stack after a context-isolated expansion.
-    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
-        self.ctes_being_defined = saved;
+    /// Restore names hidden by [Self::mask_shadowed_ctes_being_defined] when
+    /// their shadowing scope ends. Membership is all that matters for the
+    /// circular-reference check, so restore order is irrelevant.
+    pub fn unmask_shadowed_ctes_being_defined(&mut self, masked: Vec<String>) {
+        self.ctes_being_defined.extend(masked);
+    }
+
+    /// Expand a view with circular-reference tracking and without the caller's
+    /// CTE context. Restore both stacks even when expansion returns an error.
+    pub fn with_view_expansion<T>(
+        &mut self,
+        database_id: usize,
+        name: &str,
+        expand: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        // check
+        if self
+            .views_being_expanded
+            .iter()
+            .any(|(db, n)| *db == database_id && n == name)
+        {
+            crate::bail_parse_error!("view {} is circularly defined", name);
+        }
+
+        // push
+        self.views_being_expanded
+            .push((database_id, name.to_owned()));
+        let saved_ctes = std::mem::take(&mut self.ctes_being_defined);
+
+        // expand
+        let result = expand(self);
+
+        // pop
+        self.ctes_being_defined = saved_ctes;
+        self.views_being_expanded.pop();
+
+        result
     }
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -853,7 +948,7 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
-    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
     }
@@ -906,7 +1001,7 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
+    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
     /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
@@ -914,21 +1009,71 @@ impl ProgramBuilder {
 
     /// Invalidate all constant spans after the given index. This is used when we want to
     /// be sure that constant optimization is never used for translating a given expression.
-    /// See [crate::translate::expr::translate_expr_no_constant_opt()] for more details.
+    /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
         self.constant_spans.truncate(idx);
     }
 
-    pub const fn alloc_register(&mut self) -> usize {
-        let reg = self.next_free_register;
-        self.next_free_register += 1;
-        reg
+    pub fn alloc_register(&mut self) -> usize {
+        self.alloc_registers(1)
     }
 
-    pub const fn alloc_registers(&mut self, amount: usize) -> usize {
+    pub fn alloc_registers(&mut self, amount: usize) -> usize {
+        if amount == 0 {
+            return self.next_free_register;
+        }
+        if let Some(index) = self
+            .free_register_ranges
+            .iter()
+            .position(|range| range.len() >= amount)
+        {
+            let reg = self.free_register_ranges[index].start;
+            self.free_register_ranges[index].start += amount;
+            if self.free_register_ranges[index].is_empty() {
+                self.free_register_ranges.remove(index);
+            }
+            return reg;
+        }
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
+    }
+
+    /// Allow later code to use registers that a removed plan had reserved.
+    pub(crate) fn release_registers(&mut self, start: usize, amount: usize) {
+        if amount == 0 {
+            return;
+        }
+        let end = start.checked_add(amount).expect("register range overflow");
+        turso_assert!(start > 0 && end <= self.next_free_register);
+        self.free_register_ranges.push(start..end);
+        self.free_register_ranges
+            .sort_unstable_by_key(|range| range.start);
+
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(self.free_register_ranges.len());
+        for range in self.free_register_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                turso_assert!(last.end <= range.start, "register range released twice");
+                if last.end == range.start {
+                    last.end = range.end;
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        self.free_register_ranges = merged;
+
+        while self
+            .free_register_ranges
+            .last()
+            .is_some_and(|range| range.end == self.next_free_register)
+        {
+            let range = self
+                .free_register_ranges
+                .pop()
+                .expect("last register range was present");
+            self.next_free_register = range.start;
+        }
     }
 
     /// Returns the next register that will be allocated by alloc_register/alloc_registers.
@@ -1005,11 +1150,40 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if let Some(cursor) = self.free_cursor_ids.pop() {
+            self.cursor_ref[cursor] = (key, cursor_type);
+            return cursor;
+        }
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
         turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
+    }
+
+    /// Allow later code to use a cursor that a removed plan had reserved.
+    pub(crate) fn release_cursor_id(&mut self, cursor_id: usize) {
+        turso_assert!(cursor_id < self.next_free_cursor_id);
+        turso_assert!(!self.free_cursor_ids.contains(&cursor_id));
+
+        if cursor_id + 1 == self.next_free_cursor_id {
+            self.cursor_ref.pop();
+            self.next_free_cursor_id -= 1;
+            while let Some(index) = self
+                .free_cursor_ids
+                .iter()
+                .position(|id| *id + 1 == self.next_free_cursor_id)
+            {
+                self.free_cursor_ids.remove(index);
+                self.cursor_ref.pop();
+                self.next_free_cursor_id -= 1;
+            }
+            return;
+        }
+
+        self.free_cursor_ids.push(cursor_id);
+        self.free_cursor_ids
+            .sort_unstable_by(|left, right| right.cmp(left));
     }
 
     pub fn add_pragma_result_column(&mut self, col_name: String) {
@@ -1034,7 +1208,112 @@ impl ProgramBuilder {
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
         }
+        if let Insn::Column {
+            cursor_id,
+            column,
+            dest,
+            default,
+        } = insn
+        {
+            self.emit_column_maybe_fused(cursor_id, column, dest, default);
+            return;
+        }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Emit a deferred table seek when the index can identify a table row.
+    pub fn emit_deferred_seek(&mut self, index_cursor_id: CursorID, table_cursor_id: CursorID) {
+        let cursor_type = self.get_cursor_type(index_cursor_id);
+        // A rowid-free index cannot identify a base-table row. Such a plan must
+        // read all required values from the index. SQLite emits no DeferredSeek.
+        if matches!(cursor_type, Some(CursorType::BTreeIndex(index)) if !index.has_rowid) {
+            return;
+        }
+        turso_assert!(
+            matches!(
+                cursor_type,
+                Some(CursorType::BTreeIndex(_) | CursorType::IndexMethod(_))
+            ),
+            "a deferred seek requires an index cursor"
+        );
+        self.emit_insn(Insn::DeferredSeek {
+            index_cursor_id,
+            table_cursor_id,
+        });
+    }
+
+    /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
+    /// or `ColumnRange` on the same cursor when both the column index and the destination register
+    /// are exactly consecutive and no label is set to target the current opcode.
+    fn emit_column_maybe_fused(
+        &mut self,
+        cursor_id: CursorID,
+        column: usize,
+        dest: usize,
+        default: Option<Value>,
+    ) {
+        if self.column_run_fusable(cursor_id) && !self.label_targets_next_insn() {
+            if let Some((prev_insn, _)) = self.insns.last_mut() {
+                match prev_insn {
+                    Insn::Column {
+                        cursor_id: prev_cursor,
+                        column: prev_column,
+                        dest: prev_dest,
+                        default: prev_default,
+                    } if *prev_cursor == cursor_id
+                        && column == *prev_column + 1
+                        && dest == *prev_dest + 1 =>
+                    {
+                        let defaults = vec![prev_default.take(), default];
+                        *prev_insn = Insn::ColumnRange {
+                            cursor_id,
+                            start_column: *prev_column,
+                            dest: *prev_dest,
+                            defaults,
+                        };
+                        return;
+                    }
+                    Insn::ColumnRange {
+                        cursor_id: prev_cursor,
+                        start_column,
+                        dest: prev_dest,
+                        defaults,
+                    } if *prev_cursor == cursor_id
+                        && column == *start_column + defaults.len()
+                        && dest == *prev_dest + defaults.len() =>
+                    {
+                        defaults.push(default);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.insns.push((
+            Insn::Column {
+                cursor_id,
+                column,
+                dest,
+                default,
+            },
+            self.insns.len(),
+        ));
+    }
+
+    fn column_run_fusable(&self, cursor_id: CursorID) -> bool {
+        self.cursor_ref
+            .get(cursor_id)
+            .map(|(_, cursor_type)| cursor_type.accepts_column_range_fusing())
+            .unwrap_or(false)
+    }
+
+    fn label_targets_next_insn(&self) -> bool {
+        let Some(last) = self.insns.len().checked_sub(1) else {
+            return false;
+        };
+        let last = last as u32;
+        self.label_to_resolved_offset.contains(&Some(last))
     }
 
     /// Emit an instruction that should not start or extend a constant span on its own.
@@ -1110,40 +1389,85 @@ impl ProgramBuilder {
     }
 
     pub fn add_comment(&mut self, insn_index: BranchOffset, comment: &'static str) {
-        if let QueryMode::Explain | QueryMode::ExplainQueryPlan = self.query_mode {
-            self.comments.push((insn_index.as_offset_int(), comment));
+        if let BuilderQueryMode::Explain | BuilderQueryMode::ExplainQueryPlan { .. } = self.mode {
+            self.explain
+                .comments
+                .push((insn_index.as_offset_int(), comment));
         }
     }
 
     pub const fn get_query_mode(&self) -> QueryMode {
-        self.query_mode
+        self.mode.query_mode()
     }
 
-    /// use emit_explain macro instead, because we don't want to allocate
-    /// String if we are not in explain mode
-    pub fn emit_explain(&mut self, push: bool, detail: String) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            self.emit_insn(Insn::Explain {
-                p1: self.insns.len(),
-                p2: self.current_parent_explain_idx,
-                detail,
-            });
-            if push {
-                self.current_parent_explain_idx = Some(self.insns.len() - 1);
-            }
+    /// Prefer calling the emit_explain! macro instead.
+    pub fn emit_explain_should_not_be_called_directly(&mut self, push: bool, detail: EqpDetail) {
+        let BuilderQueryMode::ExplainQueryPlan {
+            current_parent_idx, ..
+        } = self.mode
+        else {
+            return;
+        };
+        self.emit_insn(Insn::Explain {
+            p1: self.insns.len(),
+            p2: current_parent_idx,
+            detail: Box::new(detail),
+        });
+        if push {
+            let emitted = self.insns.len() - 1;
+            *self.current_parent_idx_mut() = Some(emitted);
         }
     }
 
-    pub fn pop_current_parent_explain(&mut self) {
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            if let Some(current) = self.current_parent_explain_idx {
-                let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
-                    unreachable!("current_parent_explain_idx must point to an Explain insn");
-                };
-                self.current_parent_explain_idx = *p2;
+    pub fn with_cte_materialization_eqp<T>(
+        &mut self,
+        cte_id: usize,
+        name: &str,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let insns_start = self.insns.len();
+        let emitted = emit(self)?;
+        if self.mode.is_explain_query_plan() {
+            let node_ids: Vec<usize> = (insns_start..self.insns.len())
+                .filter(|&i| matches!(self.insns[i].0, Insn::Explain { .. }))
+                .collect();
+            if !node_ids.is_empty() {
+                self.explain
+                    .cte_materializations
+                    .push(EqpCteMaterialization {
+                        cte_id,
+                        name: name.to_string(),
+                        node_ids,
+                    });
             }
-        } else {
-            turso_debug_assert!(self.current_parent_explain_idx.is_none());
+        }
+        Ok(emitted)
+    }
+
+    pub fn pop_current_parent_explain(&mut self) {
+        let BuilderQueryMode::ExplainQueryPlan {
+            current_parent_idx: Some(current),
+            ..
+        } = self.mode
+        else {
+            return;
+        };
+        let (Insn::Explain { p2, .. }, _) = &self.insns[current] else {
+            unreachable!("current_parent_idx must point to an Explain insn");
+        };
+        let grandparent = *p2;
+        *self.current_parent_idx_mut() = grandparent;
+    }
+
+    /// Panics if `self.mode` is not `ExplainQueryPlan`.
+    fn current_parent_idx_mut(&mut self) -> &mut Option<usize> {
+        match &mut self.mode {
+            BuilderQueryMode::ExplainQueryPlan {
+                current_parent_idx, ..
+            } => current_parent_idx,
+            BuilderQueryMode::Normal | BuilderQueryMode::Explain => {
+                unreachable!("caller must check EXPLAIN QUERY PLAN mode first")
+            }
         }
     }
 
@@ -1203,14 +1527,9 @@ impl ProgramBuilder {
             }
         }
 
-        for (offset, _) in self.comments.iter_mut() {
-            *offset = old_to_new[*offset as usize] as u32;
-        }
+        self.explain.remap_insn_indices(&old_to_new);
 
-        if let QueryMode::ExplainQueryPlan = self.query_mode {
-            self.current_parent_explain_idx =
-                self.current_parent_explain_idx.map(|old| old_to_new[old]);
-
+        if self.mode.is_explain_query_plan() {
             for i in 0..self.insns.len() {
                 let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
                     continue;
@@ -1225,6 +1544,9 @@ impl ProgramBuilder {
                 *p1 = i;
                 *p2 = new_p2;
             }
+
+            let current_parent_idx = self.current_parent_idx_mut();
+            *current_parent_idx = current_parent_idx.map(|old| old_to_new[old]);
         }
     }
 
@@ -1402,6 +1724,12 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::IsType { target_pc, .. } => {
+                    resolve(target_pc, "IsType")?;
+                }
+                Insn::IfNullRow { target_pc, .. } => {
+                    resolve(target_pc, "IfNullRow")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }
@@ -1416,6 +1744,9 @@ impl ProgramBuilder {
                     ..
                 } => {
                     resolve(target_pc_when_reentered, "Once")?;
+                }
+                Insn::ResetOnce { region_end, .. } => {
+                    resolve(region_end, "ResetOnce")?;
                 }
                 Insn::Prev { pc_if_prev, .. } => {
                     resolve(pc_if_prev, "Prev")?;
@@ -1485,7 +1816,14 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
                 Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
+                Insn::HashProbe {
+                    target_pc,
+                    deferred_target_pc,
+                    ..
+                } => {
+                    resolve(target_pc, "HashProbe")?;
+                    resolve(deferred_target_pc, "HashProbe")?;
+                }
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::HashScanUnmatched { target_pc, .. } => {
@@ -1514,15 +1852,26 @@ impl ProgramBuilder {
         Ok(())
     }
 
-    /// Set a cursor override for a table. When resolving a table cursor for this table,
-    /// the override cursor will be used instead of the normal resolution.
-    pub fn set_cursor_override(&mut self, table_ref_id: TableInternalId, cursor_id: CursorID) {
-        self.cursor_overrides.insert(table_ref_id.into(), cursor_id);
+    /// Use a different table cursor until [`Self::clear_table_cursor_override`] removes it.
+    pub fn set_table_cursor_override(
+        &mut self,
+        table_ref_id: TableInternalId,
+        cursor_id: CursorID,
+    ) {
+        self.cursor_overrides
+            .push((CursorKey::table(table_ref_id), cursor_id));
     }
 
-    /// Clear the cursor override for a table.
-    pub fn clear_cursor_override(&mut self, table_ref_id: TableInternalId) {
-        self.cursor_overrides.remove(&table_ref_id.into());
+    /// Remove the newest table-cursor mapping for this table reference.
+    pub fn clear_table_cursor_override(&mut self, table_ref_id: TableInternalId) {
+        let key = CursorKey::table(table_ref_id);
+        if let Some(position) = self
+            .cursor_overrides
+            .iter()
+            .rposition(|(candidate, _)| candidate.equals(&key))
+        {
+            self.cursor_overrides.remove(position);
+        }
     }
 
     /// Clear all cursor overrides.
@@ -1530,21 +1879,37 @@ impl ProgramBuilder {
         self.cursor_overrides.clear();
     }
 
-    /// Check if a cursor override is active for a given table.
-    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
-        self.cursor_overrides.contains_key(&table_ref_id.into())
+    /// Return true if this table reference has a temporary table cursor.
+    pub fn has_table_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
+        let key = CursorKey::table(table_ref_id);
+        self.cursor_overrides
+            .iter()
+            .any(|(candidate, _)| candidate.equals(&key))
+    }
+
+    /// Emit code with temporary cursor mappings, then restore the prior mappings.
+    /// The mappings are also restored when code generation returns an error.
+    pub fn with_cursor_overrides<T>(
+        &mut self,
+        overrides: &[(CursorKey, CursorID)],
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous_overrides = self.cursor_overrides.clone();
+        self.cursor_overrides.extend_from_slice(overrides);
+        let result = emit(self);
+        self.cursor_overrides = previous_overrides;
+        result
     }
 
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
-        // Check cursor overrides first, only apply override for table cursors.
-        // Index cursor lookups are not overridden because when a cursor override is active,
-        // the calling code (translate_expr) should skip index logic entirely.
-        if key.index.is_none() && !key.is_build {
-            let table_id: usize = key.table_reference_id.into();
-            if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
-                return Some(cursor_id);
-            }
+        if let Some((_, cursor_id)) = self
+            .cursor_overrides
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate.equals(key))
+        {
+            return Some(*cursor_id);
         }
         self.cursor_ref
             .iter()
@@ -1660,7 +2025,7 @@ impl ProgramBuilder {
         }
     }
 
-    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// Tries to mirror: <https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379>
     pub fn begin_write_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
         self.write_databases.set(crate::MAIN_DB_ID)
@@ -1787,9 +2152,12 @@ impl ProgramBuilder {
         self.table_references.contains_table(table)
     }
 
-    /// Returns true if the cursor is a BTreeTable cursor.
+    /// Returns true if the cursor is backed by a table or index B-tree.
     pub fn cursor_is_btree(&self, cursor_id: CursorID) -> bool {
-        matches!(self.cursor_ref[cursor_id].1, CursorType::BTreeTable(_))
+        matches!(
+            self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(_) | CursorType::BTreeIndex(_)
+        )
     }
 
     /// Returns the BTreeTable for the given cursor, if it is a BTreeTable cursor.
@@ -1828,6 +2196,8 @@ impl ProgramBuilder {
         self.emit_insn(Insn::Next {
             cursor_id,
             pc_if_next: loop_start,
+            fullscan: false,
+            is_index: false,
         });
         self.preassign_label_to_next_insn(loop_end);
     }
@@ -1940,7 +2310,10 @@ impl ProgramBuilder {
             };
             if let Some(converted) = affinity.convert(&value) {
                 value = match converted {
-                    either::Either::Left(val_ref) => val_ref.to_owned(),
+                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+                    either::Either::Left(_) => {
+                        unreachable!("affinity conversion returned an unexpected borrowed value")
+                    }
                     either::Either::Right(val) => val,
                 };
             }
@@ -1971,6 +2344,26 @@ impl ProgramBuilder {
     ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
 
+        // Fill in the is_index field on Next and Prev, now that we know all cursor types
+        for (insn, _) in self.insns.iter_mut() {
+            if let Insn::Next {
+                cursor_id,
+                is_index,
+                ..
+            }
+            | Insn::Prev {
+                cursor_id,
+                is_index,
+                ..
+            } = insn
+            {
+                *is_index = self
+                    .cursor_ref
+                    .get(*cursor_id)
+                    .is_some_and(|(_, cursor_type)| cursor_type.is_index());
+            }
+        }
+
         self.parameters.list.dedup();
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
@@ -1986,13 +2379,18 @@ impl ProgramBuilder {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
-            comments: self.comments,
+            explain: self.explain,
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
+            refreshes_analyze_stats: sql
+                .trim_start()
+                .as_bytes()
+                .get(..7)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"ANALYZE")),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
@@ -2016,5 +2414,51 @@ impl ProgramBuilder {
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+pub(crate) trait CursorTypeExt {
+    fn accepts_column_range_fusing(&self) -> bool;
+}
+
+impl CursorTypeExt for CursorType {
+    fn accepts_column_range_fusing(&self) -> bool {
+        matches!(
+            self,
+            CursorType::BTreeTable(_)
+                | CursorType::BTreeIndex(_)
+                | CursorType::Pseudo(_)
+                | CursorType::Sorter
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_override_scope_restores_prior_mapping_after_error() {
+        let mut builder =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(3, 0, 0));
+        let table_id = TableInternalId::default();
+        let table_key = CursorKey::table(table_id);
+        let main_cursor = builder.alloc_cursor_id_keyed(table_key.clone(), CursorType::Sorter);
+        let outer_cursor = builder.alloc_cursor_id(CursorType::Sorter);
+        builder.set_table_cursor_override(table_id, outer_cursor);
+
+        let inner_cursor = builder.alloc_cursor_id(CursorType::Sorter);
+        let result: Result<()> =
+            builder.with_cursor_overrides(&[(table_key.clone(), inner_cursor)], |builder| {
+                assert_eq!(builder.resolve_cursor_id(&table_key), inner_cursor);
+                Err(crate::LimboError::InternalError(
+                    "expected test error".into(),
+                ))
+            });
+
+        assert!(result.is_err());
+        assert_eq!(builder.resolve_cursor_id(&table_key), outer_cursor);
+        builder.clear_table_cursor_override(table_id);
+        assert_eq!(builder.resolve_cursor_id(&table_key), main_cursor);
     }
 }

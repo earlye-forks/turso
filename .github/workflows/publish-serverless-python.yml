@@ -1,0 +1,39 @@
+name: Publish serverless Python
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  working-directory: serverless/python
+
+jobs:
+  publish:
+    if: github.repository == 'tursodatabase/turso'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build
+        run: uv build
+
+      - name: Smoke test wheel
+        run: |
+          uv venv smoke
+          uv pip install --python smoke dist/*.whl
+          smoke/bin/python -c "import turso_serverless; print(turso_serverless.__name__)"
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish

@@ -8,7 +8,6 @@ on:
     tags:
       - "v*"
   pull_request:
-    branches: ["main"]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -22,18 +21,21 @@ env:
   GH_TOKEN: ${{ secrets.TURSO_GO_PLATFORM_LIBS_TOKEN }}
   CARGO_INCREMENTAL: "0"
   CARGO_NET_RETRY: 10
+  # Some Windows runner images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
   test:
     name: Build Rust and run Go tests
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       matrix:
         os:
-          - blacksmith-4vcpu-ubuntu-2404
-          - blacksmith-6vcpu-macos-latest
-          - windows-latest
+          - ubuntu-24.04
+          - macos-latest
+          - windows-2025
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -42,6 +44,10 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
 
       - name: Setup mold linker
         if: runner.os == 'Linux'
@@ -91,6 +97,7 @@ jobs:
           go test ./... -v
 
   publish:
+    if: github.repository == 'tursodatabase/turso'
     name: Publish Go driver
     needs: test
     runs-on: ubuntu-latest
@@ -102,7 +109,13 @@ jobs:
           fetch-depth: 0
 
       - name: Ensure tooling (jq, coreutils)
+        shell: bash
         run: |
+          set -euo pipefail
+          if command -v jq >/dev/null && command -v sha256sum >/dev/null; then
+            echo "jq and coreutils are already installed."
+            exit 0
+          fi
           sudo apt-get update
           sudo apt-get install -y jq coreutils
 

@@ -20,6 +20,7 @@ on:
   #   - cron: '0 7 * * *' # nightly at 07:00 UTC
 jobs:
   verify:
+    if: github.repository == 'tursodatabase/turso'
     runs-on: ubuntu-latest
     env:
       # The per-repo conductor instance; managed via the ARETTA_API_URL repo Variable.

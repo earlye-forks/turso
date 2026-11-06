@@ -156,12 +156,7 @@ impl IO for Opfs {
         Ok(())
     }
 
-    /// OPFS exposes no directory sync.
-    fn sync_parent_dir(
-        &self,
-        _path: &str,
-        _c: turso_core::Completion,
-    ) -> turso_core::Result<turso_core::Completion> {
+    fn sync_parent_dir(&self, _path: &str, _c: Completion) -> turso_core::Result<Completion> {
         Err(turso_core::LimboError::IoExtensionUnsupported(
             "sync_parent_dir",
         ))
