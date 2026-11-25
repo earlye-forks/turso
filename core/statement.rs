@@ -1467,9 +1467,9 @@ impl Statement {
                 };
                 max_index = max_index.max(index);
                 let value = NonZero::new(index)
-                    .map(|i| self.state.get_parameter(i))
-                    .unwrap_or(Value::Null);
-                append_expanded_literal(&mut out, &value);
+                    .and_then(|i| self.state.get_parameter(i))
+                    .map_or(&Value::Null, |parameter| &**parameter);
+                append_expanded_literal(&mut out, value);
             } else {
                 out.push_str(&String::from_utf8_lossy(token.value));
             }

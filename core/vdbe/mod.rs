@@ -309,11 +309,25 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Register {
     Value(Value),
+    Shared(Arc<Value>),
     Aggregate(AggContext),
     Record(ImmutableRecord),
+}
+
+impl PartialEq for Register {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Register::Aggregate(a), Register::Aggregate(b)) => a == b,
+            (Register::Record(a), Register::Record(b)) => a == b,
+            _ => match (self.as_value(), other.as_value()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
+        }
+    }
 }
 
 impl TryClone for Register {
@@ -322,6 +336,7 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
+            Register::Shared(value) => Ok(Register::Shared(value.clone())),
             Register::Aggregate(_) => unreachable!("aggregate accumulators cannot be copied"),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
@@ -347,6 +362,7 @@ impl TryClone for Register {
                 value.try_clone_from(src)?;
                 *dst = Register::Value(value);
             }
+            (dst, Register::Shared(src)) => *dst = Register::Shared(src.clone()),
             (dst, Register::Record(src)) => {
                 *dst = Register::Record(ImmutableRecord::copy_payload(
                     src.get_payload(),
@@ -404,8 +420,35 @@ impl Register {
     }
 
     #[inline]
-    pub const fn is_null(&self) -> bool {
-        matches!(self, Register::Value(Value::Null))
+    pub fn is_null(&self) -> bool {
+        matches!(self.as_value(), Some(Value::Null))
+    }
+
+    #[inline]
+    pub fn as_value(&self) -> Option<&Value> {
+        match self {
+            Register::Value(value) => Some(value),
+            Register::Shared(value) => Some(value),
+            Register::Aggregate(_) | Register::Record(_) => None,
+        }
+    }
+
+    pub fn share_parameter(&mut self, parameter: &Arc<Value>) {
+        match **parameter {
+            Value::Text(_) | Value::Blob(_) => *self = Register::Shared(parameter.clone()),
+            Value::Null => self.set_null(),
+            Value::Numeric(numeric) => self.set_numeric(numeric),
+        }
+    }
+
+    pub fn stop_sharing(&mut self) {
+        if !matches!(self, Register::Shared(_)) {
+            return;
+        }
+        let Register::Shared(shared) = std::mem::replace(self, Register::Value(Value::Null)) else {
+            unreachable!("register was checked to be shared");
+        };
+        *self = Register::Value(Arc::unwrap_or_clone(shared));
     }
 
     #[inline(always)]
@@ -917,7 +960,7 @@ pub struct ProgramState {
     pub query_deadline: Option<crate::MonotonicInstant>,
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
-    pub parameters: Vec<Value>,
+    pub parameters: Vec<Arc<Value>>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1138,20 +1181,12 @@ impl ProgramState {
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
         let i = index.get() - 1;
         if i >= self.parameters.len() {
-            self.parameters.resize(i + 1, Value::Null);
+            self.parameters.resize_with(i + 1, || Arc::new(Value::Null));
         }
         let slot = &mut self.parameters[i];
-        match (slot, value) {
-            (Value::Null, Value::Null) => {}
-            (Value::Numeric(Numeric::Integer(existing)), Value::Numeric(Numeric::Integer(new))) => {
-                *existing = new
-            }
-            (Value::Numeric(Numeric::Float(existing)), Value::Numeric(Numeric::Float(new))) => {
-                *existing = new
-            }
-            (Value::Text(existing), Value::Text(new)) => existing.do_extend(&new)?,
-            (Value::Blob(existing), Value::Blob(new)) => existing.do_extend(&new)?,
-            (slot, value) => *slot = value,
+        match Arc::get_mut(slot) {
+            Some(existing) => *existing = value,
+            None => *slot = Arc::new(value),
         }
         Ok(())
     }
@@ -1160,9 +1195,8 @@ impl ProgramState {
         self.parameters.clear();
     }
 
-    pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
-        let i = index.get() - 1;
-        self.parameters.get(i).cloned().unwrap_or(Value::Null)
+    pub fn get_parameter(&self, index: NonZero<usize>) -> Option<&Arc<Value>> {
+        self.parameters.get(index.get() - 1)
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
@@ -1762,6 +1796,7 @@ impl Register {
     pub fn get_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,
+            Register::Shared(v) => v,
             _ => self.get_value_of_other(),
         }
     }
@@ -2248,6 +2283,7 @@ impl Program {
                 if old_reg != new_reg {
                     match &state.registers[i] {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                        Register::Shared(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
                     }
@@ -3851,10 +3887,9 @@ impl Row {
                 .as_ref()
                 .expect("row value pointer should be valid")
         };
-        let value = match value {
-            Register::Value(value) => value,
-            _ => unreachable!("a row should be formed of values only"),
-        };
+        let value = value
+            .as_value()
+            .expect("a row should be formed of values only");
         T::from_value(value)
     }
 
@@ -3865,10 +3900,9 @@ impl Row {
                 .as_ref()
                 .expect("row value pointer should be valid")
         };
-        match value {
-            Register::Value(value) => value,
-            _ => unreachable!("a row should be formed of values only"),
-        }
+        value
+            .as_value()
+            .expect("a row should be formed of values only")
     }
 
     pub fn get_values(&self) -> impl Iterator<Item = &Value> {

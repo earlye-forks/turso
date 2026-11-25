@@ -7186,7 +7186,7 @@ pub fn op_decr_jump_zero(
                 state.pc += 1;
             }
         }
-        Register::Value(_) | Register::Record(_) => {
+        Register::Value(_) | Register::Shared(_) | Register::Record(_) => {
             bail_constraint_error!("datatype mismatch");
         }
         Register::Aggregate(_) => {
@@ -9083,9 +9083,8 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         if let AggFunc::Count | AggFunc::Count0 = func {
             let counts = match (func, &state.registers[*col]) {
                 (AggFunc::Count0, _) => Some(true),
-                (_, Register::Value(Value::Null)) => Some(false),
-                (_, Register::Value(_) | Register::Record(_)) => Some(true),
                 (_, Register::Aggregate(_)) => None,
+                (_, register) => Some(!register.is_null()),
             };
             if let Some(counts) = counts {
                 let mut payload = state
@@ -12282,8 +12281,10 @@ pub fn op_yield(
                 for reg in &mut state.registers
                     [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
                 {
-                    if let Register::Value(Value::Text(text)) = reg {
-                        if text.subtype == TextSubtype::Json {
+                    if matches!(reg.as_value(), Some(Value::Text(text)) if text.subtype == TextSubtype::Json)
+                    {
+                        reg.stop_sharing();
+                        if let Register::Value(Value::Text(text)) = reg {
                             text.subtype = TextSubtype::Text;
                         }
                     }
@@ -12491,13 +12492,13 @@ pub fn op_insert(
                     if existing_key == Some(key) {
                         let record = match &state.registers[*record_reg] {
                             Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                            Register::Value(value) => {
-                                let values = [value];
-                                let record = ImmutableRecord::from_values(values, values.len())?;
-                                std::borrow::Cow::Owned(record)
-                            }
                             Register::Aggregate(..) => {
                                 unreachable!("Cannot insert an aggregate value.")
+                            }
+                            register => {
+                                let values = [register.get_value()];
+                                let record = ImmutableRecord::from_values(values, values.len())?;
+                                std::borrow::Cow::Owned(record)
                             }
                         };
                         let existing_payload = return_if_io!(state, cursor.record_payload());
@@ -12513,13 +12514,13 @@ pub fn op_insert(
                 if !state.active_op_state.insert().is_noop_update {
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                        Register::Value(value) => {
-                            let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len())?;
-                            std::borrow::Cow::Owned(record)
-                        }
                         Register::Aggregate(..) => {
                             unreachable!("Cannot insert an aggregate value.")
+                        }
+                        register => {
+                            let values = [register.get_value()];
+                            let record = ImmutableRecord::from_values(values, values.len())?;
+                            std::borrow::Cow::Owned(record)
                         }
                     };
                     let cursor = get_cursor!(state, *cursor_id);
@@ -12616,13 +12617,13 @@ pub fn op_insert(
 
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
-                        Register::Value(value) => {
-                            let values = [value];
-                            let record = ImmutableRecord::from_values(values, values.len())?;
-                            std::borrow::Cow::Owned(record)
-                        }
                         Register::Aggregate(..) => {
                             unreachable!("Cannot insert an aggregate value.")
+                        }
+                        register => {
+                            let values = [register.get_value()];
+                            let record = ImmutableRecord::from_values(values, values.len())?;
+                            std::borrow::Cow::Owned(record)
                         }
                     };
 
@@ -15017,7 +15018,7 @@ pub fn op_is_null(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(IsNull { reg, target_pc }, insn);
-    if matches!(state.registers[*reg], Register::Value(Value::Null)) {
+    if state.registers[*reg].is_null() {
         state.pc = target_pc.as_offset_int();
     } else {
         state.pc += 1;
@@ -15817,11 +15818,7 @@ pub fn op_add_imm(
     load_insn!(AddImm { register, value }, insn);
 
     let current = &state.registers[*register];
-    let current_value = match current {
-        Register::Value(val) => val,
-        Register::Aggregate(_) => &Value::Null,
-        Register::Record(_) => &Value::Null,
-    };
+    let current_value = current.as_value().unwrap_or(&Value::Null);
 
     // SQLite coerces the register to an integer before adding.
     let lhs = match current_value {
@@ -15847,7 +15844,10 @@ pub fn op_variable(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Variable { index, dest }, insn);
-    state.registers[*dest].set_value(state.get_parameter(*index));
+    match state.parameters.get(index.get() - 1) {
+        Some(parameter) => state.registers[*dest].share_parameter(parameter),
+        None => state.registers[*dest].set_null(),
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -18460,7 +18460,7 @@ pub fn op_hash_grace_advance_partition(
 #[inline(always)]
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     // handle the common cases that don't require a conversion inline
-    if let Register::Value(value) = target {
+    if let Some(value) = target.as_value() {
         let settled = match affinity {
             Affinity::Blob | Affinity::None => true,
             Affinity::Text => matches!(value, Value::Text(_) | Value::Null | Value::Blob(_)),
@@ -18482,6 +18482,23 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
 
 #[inline(never)]
 fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
+    if let Register::Shared(shared) = target {
+        match (&**shared, affinity) {
+            (Value::Blob(_) | Value::Null, _)
+            | (_, Affinity::Blob | Affinity::None)
+            | (Value::Text(_), Affinity::Text) => return true,
+            (Value::Text(text), _) => {
+                return match text_with_numeric_affinity(text.as_str(), affinity) {
+                    Some((converted, complete)) => {
+                        *target = Register::Value(converted);
+                        complete
+                    }
+                    None => false,
+                };
+            }
+            (Value::Numeric(_), _) => target.stop_sharing(),
+        }
+    }
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
             return true;
@@ -18514,44 +18531,13 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
-                    let text = trim_ascii_whitespace(t.as_str());
-
-                    // Handle hex numbers - they shouldn't be converted
-                    if text.starts_with("0x") {
-                        return false;
-                    }
-
-                    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
-                    let num = match parse_result {
-                        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
-                            return false;
+                    return match text_with_numeric_affinity(t.as_str(), affinity) {
+                        Some((converted, complete)) => {
+                            *value = converted;
+                            complete
                         }
-                        NumericParseResult::PureInteger | NumericParseResult::HasDecimalOrExp => {
-                            match parsed_value {
-                                ParsedNumber::Integer(i) => Value::from_i64(i),
-                                ParsedNumber::Float(f) => Value::from_f64(f),
-                                ParsedNumber::None => return false,
-                            }
-                        }
+                        None => false,
                     };
-
-                    match num {
-                        Value::Numeric(Numeric::Integer(i)) => {
-                            *value = Value::from_i64(i);
-                            return true;
-                        }
-                        Value::Numeric(Numeric::Float(fl)) => {
-                            // For both Numeric and Integer affinity, try to convert
-                            // float to int if exact. SQLite treats INTEGER identically
-                            // to NUMERIC here: both enter applyNumericAffinity() with
-                            // bTryForInt=1 (sqlite/src/vdbe.c:403-408).
-                            return try_float_to_integer_affinity(value, f64::from(fl));
-                        }
-                        other => {
-                            *value = other;
-                            return true;
-                        }
-                    }
                 }
 
                 return false;
@@ -18566,27 +18552,13 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
                     return true;
                 }
                 Value::Text(t) => {
-                    let text = trim_ascii_whitespace(t.as_str());
-                    if text.starts_with("0x") {
-                        return false;
-                    }
-
-                    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
-                    let coerced = match parse_result {
-                        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
-                            return false;
+                    return match text_with_numeric_affinity(t.as_str(), affinity) {
+                        Some((converted, complete)) => {
+                            *value = converted;
+                            complete
                         }
-                        NumericParseResult::PureInteger | NumericParseResult::HasDecimalOrExp => {
-                            match parsed_value {
-                                ParsedNumber::Integer(i) => Value::from_f64(i as f64),
-                                ParsedNumber::Float(f) => Value::from_f64(f),
-                                ParsedNumber::None => return false,
-                            }
-                        }
+                        None => false,
                     };
-
-                    *value = coerced;
-                    return true;
                 }
                 _ => return true,
             },
@@ -18594,6 +18566,34 @@ fn apply_affinity_char_slow(target: &mut Register, affinity: Affinity) -> bool {
     }
 
     true
+}
+
+fn text_with_numeric_affinity(text: &str, affinity: Affinity) -> Option<(Value, bool)> {
+    let text = trim_ascii_whitespace(text);
+    if text.starts_with("0x") {
+        return None;
+    }
+    let (parse_result, parsed_value) = try_for_float(text.as_bytes());
+    if matches!(
+        parse_result,
+        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly
+    ) {
+        return None;
+    }
+    match (parsed_value, affinity) {
+        (ParsedNumber::None, _) => None,
+        (ParsedNumber::Integer(i), Affinity::Real) => Some((Value::from_f64(i as f64), true)),
+        (ParsedNumber::Float(f), Affinity::Real) => Some((Value::from_f64(f), true)),
+        (ParsedNumber::Integer(i), _) => Some((Value::from_i64(i), true)),
+        (ParsedNumber::Float(f), _) => match Value::from_f64(f) {
+            Value::Numeric(Numeric::Float(fl)) => {
+                let mut converted = Value::Null;
+                let complete = try_float_to_integer_affinity(&mut converted, f64::from(fl));
+                Some((converted, complete))
+            }
+            other => Some((other, true)),
+        },
+    }
 }
 
 fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
@@ -20637,5 +20637,79 @@ mod tests {
             result.is_ok(),
             "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
+    }
+
+    mod param_sharing_tests {
+        use super::super::{apply_affinity_char, Affinity};
+        use crate::numeric::Numeric;
+        use crate::types::Text;
+        use crate::vdbe::Register;
+        use crate::Value;
+        use std::sync::Arc;
+
+        const EVERY_AFFINITY: [Affinity; 6] = [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ];
+
+        #[test]
+        fn affinity_leaves_a_shared_blob_shared() {
+            let shared = Arc::new(Value::Blob(crate::alloc::vec![1u8, 2, 3]));
+            for affinity in EVERY_AFFINITY {
+                let mut register = Register::Shared(shared.clone());
+                assert!(apply_affinity_char(&mut register, affinity));
+                assert_still_shares(&register, &shared);
+            }
+        }
+
+        #[test]
+        fn text_affinity_leaves_a_shared_text_shared() {
+            let shared = Arc::new(Value::Text(Text::new("hello".to_string())));
+            let mut register = Register::Shared(shared.clone());
+            assert!(apply_affinity_char(&mut register, Affinity::Text));
+            assert_still_shares(&register, &shared);
+        }
+
+        #[test]
+        fn numeric_affinity_leaves_a_shared_non_numeric_text_shared() {
+            let shared = Arc::new(Value::Text(Text::new("hello".to_string())));
+            for affinity in [Affinity::Integer, Affinity::Numeric, Affinity::Real] {
+                let mut register = Register::Shared(shared.clone());
+                assert!(!apply_affinity_char(&mut register, affinity));
+                assert_still_shares(&register, &shared);
+            }
+        }
+
+        #[test]
+        fn integer_affinity_converts_a_shared_text_into_an_owned_integer() {
+            let shared = Arc::new(Value::Text(Text::new("42".to_string())));
+            let mut register = Register::Shared(shared.clone());
+            assert!(apply_affinity_char(&mut register, Affinity::Integer));
+            assert!(matches!(
+                register,
+                Register::Value(Value::Numeric(Numeric::Integer(42)))
+            ));
+            assert_eq!(*shared, Value::Text(Text::new("42")));
+        }
+
+        #[test]
+        fn a_shared_register_equals_an_owned_register_with_the_same_value() {
+            let value = Value::Text(Text::new("42"));
+            assert_eq!(
+                Register::Shared(Arc::new(value.clone())),
+                Register::Value(value)
+            );
+        }
+
+        fn assert_still_shares(register: &Register, shared: &Arc<Value>) {
+            let Register::Shared(held) = register else {
+                panic!("register stopped sharing: {register:?}");
+            };
+            assert!(Arc::ptr_eq(held, shared));
+        }
     }
 }

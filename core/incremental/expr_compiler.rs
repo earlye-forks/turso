@@ -422,10 +422,11 @@ impl CompiledExpression {
                 }
 
                 // The compiled expression puts the result in register 0
-                match state.get_register(0) {
-                    Register::Value(v) => Ok(v.clone()),
-                    _ => Ok(Value::Null),
-                }
+                Ok(state
+                    .get_register(0)
+                    .as_value()
+                    .cloned()
+                    .unwrap_or(Value::Null))
             }
         }
     }
