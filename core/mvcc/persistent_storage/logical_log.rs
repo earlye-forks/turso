@@ -5,9 +5,13 @@
 //! The logical log stores committed MVCC operations that are not checkpointed into the main
 //! SQLite database file yet. On restart, recovery replays those operations.
 //!
+//! By default the log is named `<db stem>.db-log` (the db path with its extension replaced).
+//! When `DatabaseOpts::with_mvcc_log_suffix_naming(true)` is set, it is named `{db path}-log`,
+//! and it is opened and existence-checked only through the database's `IO`.
+//!
 //! In normal operation:
-//! - commits append transaction frames to `.db-log`;
-//! - checkpoint copies data into the DB file, then truncates `.db-log` to 0.
+//! - commits append transaction frames to the log;
+//! - checkpoint copies data into the DB file, then truncates the log to 0.
 //!
 //! ## File layout
 //!
