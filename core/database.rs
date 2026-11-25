@@ -80,6 +80,7 @@ pub struct DatabaseOpts {
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    pub enable_mvcc_log_suffix_naming: bool,
     pub orphan_wal_policy: OrphanWalPolicy,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
@@ -128,6 +129,11 @@ impl DatabaseOpts {
 
     pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
         self.enable_experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
+    pub fn with_mvcc_log_suffix_naming(mut self, enable: bool) -> Self {
+        self.enable_mvcc_log_suffix_naming = enable;
         self
     }
 
@@ -1996,8 +2002,7 @@ impl Database {
                     // `is_readonly` across the `_init` yields is stable.
                     let pager =
                         return_if_io!(self._init_nonblock(init, encryption_key, page_codec));
-                    let log_exists =
-                        journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+                    let log_exists = self.logical_log_exists()?;
                     let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
                     turso_assert!(pager.wal.is_none(), "Pager should have no WAL yet");
                     *st = HeaderValidationState::Validate {
@@ -2361,11 +2366,11 @@ impl Database {
                     pager.set_schema_cookie(None);
 
                     if open_mv_store {
-                        let canonical_path = self.get_database_canonical_path();
+                        let log_path = self.canonical_logical_log_path();
                         let enc_ctx = pager.io_ctx.read().encryption_context().cloned();
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
-                            &canonical_path,
+                            &log_path,
                             self.open_flags,
                             self.durable_storage.clone(),
                             enc_ctx,
@@ -2675,11 +2680,10 @@ impl Database {
         self.shared_wal
             .write()
             .replace_after_external_restore(new_shared_wal.into_inner());
-        if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
-        {
+        if self.mvcc_enabled() || self.logical_log_exists()? {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
-                &self.path,
+                &self.logical_log_path(),
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,
@@ -2701,6 +2705,28 @@ impl Database {
             self.mv_store.store(None);
         }
         Ok(())
+    }
+
+    fn logical_log_exists(&self) -> Result<bool> {
+        if self.opts.enable_mvcc_log_suffix_naming {
+            journal_mode::logical_log_exists_in_io(self.io.as_ref(), &self.logical_log_path())
+        } else {
+            Ok(journal_mode::logical_log_exists(std::path::Path::new(
+                &self.path,
+            )))
+        }
+    }
+
+    pub(crate) fn canonical_logical_log_path(&self) -> String {
+        if self.opts.enable_mvcc_log_suffix_naming {
+            self.logical_log_path()
+        } else {
+            journal_mode::logical_log_path(&self.get_database_canonical_path(), false)
+        }
+    }
+
+    pub(crate) fn logical_log_path(&self) -> String {
+        journal_mode::logical_log_path(&self.path, self.opts.enable_mvcc_log_suffix_naming)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

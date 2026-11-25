@@ -1,7 +1,9 @@
 use crate::sync::Arc;
 
 use crate::storage::sqlite3_ondisk::Version;
-use crate::{alloc::DynAllocator, mvcc, LimboError, MvStore, OpenFlags, Result, IO};
+use crate::{
+    alloc::DynAllocator, mvcc, CompletionError, LimboError, MvStore, OpenFlags, Result, IO,
+};
 
 #[derive(
     Debug,
@@ -62,9 +64,33 @@ pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
     std::path::Path::exists(log_path.as_path()) && log_path.as_path().metadata().unwrap().len() > 0
 }
 
+pub fn logical_log_exists_in_io(io: &dyn IO, log_path: &str) -> Result<bool> {
+    match io.open_file(log_path, OpenFlags::ReadOnly, false) {
+        Ok(file) => Ok(file.size()? > 0),
+        Err(LimboError::CompletionError(CompletionError::IOError(
+            std::io::ErrorKind::NotFound,
+            _,
+        ))) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn logical_log_path(db_path: &str, suffix_naming: bool) -> String {
+    if suffix_naming {
+        format!("{db_path}-log")
+    } else {
+        std::path::Path::new(db_path)
+            .with_extension("db-log")
+            .as_os_str()
+            .to_str()
+            .expect("path should be valid string")
+            .to_string()
+    }
+}
+
 pub fn open_mv_store(
     io: Arc<dyn IO>,
-    db_path: impl AsRef<std::path::Path>,
+    log_path: &str,
     flags: OpenFlags,
     durable_storage: Option<Arc<dyn mvcc::persistent_storage::DurableStorage>>,
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
@@ -86,13 +112,7 @@ pub fn open_mv_store(
         if let Some(storage) = durable_storage {
             storage
         } else {
-            let db_path = db_path.as_ref();
-            let log_path = db_path.with_extension("db-log");
-            let string_path = log_path
-                .as_os_str()
-                .to_str()
-                .expect("path should be valid string");
-            let file = io.open_file(string_path, flags, false)?;
+            let file = io.open_file(log_path, flags, false)?;
             Arc::new(mvcc::persistent_storage::Storage::new(
                 file,
                 io,
