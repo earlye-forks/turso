@@ -36,6 +36,8 @@ pub mod native_ext;
 pub mod numeric;
 #[cfg(all(test, feature = "fs"))]
 mod orphan_wal_tests;
+#[cfg(test)]
+mod param_sharing_tests;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;

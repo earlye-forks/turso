@@ -2932,8 +2932,8 @@ impl IndexMethodCursor for FtsCursor {
         let rowid_reg = values.last().ok_or_else(|| {
             LimboError::InternalError("FTS insert requires at least rowid".into())
         })?;
-        let rowid = match rowid_reg {
-            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+        let rowid = match rowid_reg.as_value() {
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
                 return Err(LimboError::InternalError("FTS rowid must be integer".into()).into());
             }
@@ -2943,20 +2943,20 @@ impl IndexMethodCursor for FtsCursor {
         doc.add_i64(self.rowid_field, rowid);
 
         for ((_col, field), reg) in self.text_fields.iter().zip(&values[..values.len() - 1]) {
-            match reg {
-                Register::Value(Value::Text(t)) => {
+            match reg.as_value() {
+                Some(Value::Text(t)) => {
                     doc.add_text(*field, t.as_str());
                 }
-                Register::Value(Value::Null) => continue,
+                Some(Value::Null) => continue,
                 // Coerce every non-NULL value to text before tokenizing, the
                 // way FTS5's sqlite3_value_text() does. Skipping them would
                 // make the index silently miss rows a plain scan matches.
-                Register::Value(value) => {
+                Some(value) => {
                     if let Some(text) = value.cast_text() {
                         doc.add_text(*field, &text);
                     }
                 }
-                _ => continue,
+                None => continue,
             }
         }
 
@@ -2980,8 +2980,8 @@ impl IndexMethodCursor for FtsCursor {
         let rowid_reg = values.last().ok_or_else(|| {
             LimboError::InternalError("FTS delete requires at least rowid".into())
         })?;
-        let rowid = match rowid_reg {
-            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+        let rowid = match rowid_reg.as_value() {
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
                 return Err(LimboError::InternalError("FTS rowid must be integer".into()).into());
             }
@@ -3032,8 +3032,8 @@ impl IndexMethodCursor for FtsCursor {
         }
 
         // values[0] = pattern index
-        let pattern_idx = match &values[0] {
-            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+        let pattern_idx = match values[0].as_value() {
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => FTS_PATTERN_SCORE,
         };
         self.current_pattern = pattern_idx;
@@ -3050,14 +3050,12 @@ impl IndexMethodCursor for FtsCursor {
                 // Coerce with the same rules as a plain LIMIT (MustBeInt):
                 // numeric text and integral reals become integers; anything
                 // else is a datatype mismatch, never a silent default.
-                let coerced = match &values[2] {
-                    Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => {
-                        Some(*i)
-                    }
-                    Register::Value(Value::Numeric(crate::numeric::Numeric::Float(f))) => {
+                let coerced = match values[2].as_value() {
+                    Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => Some(*i),
+                    Some(Value::Numeric(crate::numeric::Numeric::Float(f))) => {
                         crate::util::cast_real_to_integer(f64::from(*f)).ok()
                     }
-                    Register::Value(Value::Text(text)) => {
+                    Some(Value::Text(text)) => {
                         match crate::util::checked_cast_text_to_numeric(text.as_str(), true) {
                             Ok(Value::Numeric(crate::numeric::Numeric::Integer(i))) => Some(i),
                             Ok(Value::Numeric(crate::numeric::Numeric::Float(f))) => {
