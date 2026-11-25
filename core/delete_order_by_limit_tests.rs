@@ -49,6 +49,35 @@ fn delete_with_order_by_after_returning_is_refused_with_an_error_naming_order_by
     assert_all_events_remain(&conn);
 }
 
+#[test]
+fn delete_with_limit_after_returning_is_refused_with_an_error_naming_limit() {
+    let conn = open_connection_with_events();
+
+    let message = delete_error_message(
+        &conn,
+        "DELETE FROM events WHERE delete_after < 500 RETURNING id LIMIT 3",
+    );
+
+    assert!(
+        message.contains("LIMIT clause is not supported in DELETE"),
+        "{message}"
+    );
+    assert_all_events_remain(&conn);
+}
+
+#[test]
+fn delete_with_order_by_and_no_where_is_refused_with_an_error_naming_order_by() {
+    let conn = open_connection_with_events();
+
+    let message = delete_error_message(&conn, "DELETE FROM events ORDER BY id LIMIT 1");
+
+    assert!(
+        message.contains("ORDER BY clause is not supported in DELETE"),
+        "{message}"
+    );
+    assert_all_events_remain(&conn);
+}
+
 fn open_connection_with_events() -> Arc<Connection> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(

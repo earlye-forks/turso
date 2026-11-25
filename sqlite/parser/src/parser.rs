@@ -4762,7 +4762,6 @@ impl<'a> Parser<'a> {
         let tbl_name = self.parse_fullname(true)?;
         let indexed = self.parse_indexed()?;
         let where_clause = self.parse_where()?;
-        self.reject_delete_order_by_or_limit()?;
         let returning = self.parse_returning()?;
         self.reject_delete_order_by_or_limit()?;
         Ok(Stmt::Delete {

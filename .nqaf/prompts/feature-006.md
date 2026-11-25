@@ -64,9 +64,9 @@ probably drifted; search by name.
 
 ## Behaviour
 
-In `parse_delete_without_cte`, when the next token after the WHERE clause,
-or after the RETURNING clause, is `TK_ORDER` or `TK_LIMIT`, return
-`Error::Custom` with:
+In `parse_delete_without_cte`, after the optional WHERE clause and the
+optional RETURNING clause have been parsed, if the next token is `TK_ORDER`
+or `TK_LIMIT`, return `Error::Custom` with:
 
 - for `ORDER`:
   `near "ORDER": syntax error: ORDER BY clause is not supported in DELETE`
@@ -77,8 +77,11 @@ The `near "X": syntax error` prefix keeps the SQLite-compatible text that
 the existing sqltest and CLI tests match. The suffix is the message that
 turso used before `1e21c2beb`, and it names the clause.
 
-Put the check in one small helper, called at both points, below
-`parse_delete_without_cte`. Do not change UPDATE: it keeps the generic
+Put the check in one small helper below `parse_delete_without_cte`, and
+call it once, right after `parse_returning()`. `parse_where` and
+`parse_returning` consume nothing when their clause is absent, so that one
+call sees an `ORDER` or `LIMIT` that follows the table name, the WHERE
+clause, or the RETURNING clause. Do not change UPDATE: it keeps the generic
 error. Do not change the AST, the translator, or any existing test.
 
 ## Regression tests
@@ -101,8 +104,12 @@ four of them with `delete_after < 500`. Each test runs a statement through
    contains `LIMIT clause is not supported in DELETE`.
 3. `DELETE FROM events WHERE delete_after < 500 RETURNING id ORDER BY id LIMIT 3`:
    the message contains `ORDER BY clause is not supported in DELETE`.
+4. `DELETE FROM events WHERE delete_after < 500 RETURNING id LIMIT 3`:
+   the message contains `LIMIT clause is not supported in DELETE`.
+5. `DELETE FROM events ORDER BY id LIMIT 1` (no WHERE): the message
+   contains `ORDER BY clause is not supported in DELETE`.
 
-All three tests must fail without the parser change (the `Debug` output is
+All five tests must fail without the parser change (the `Debug` output is
 then a `ParseUnexpectedToken`, which contains neither message).
 
 ## Constraints
@@ -125,4 +132,4 @@ In the "Fork Features" subsection of the "About This Fork" section of
 still refused at parse time and delete nothing, as upstream, but the error
 names the clause (`near "ORDER": syntax error: ORDER BY clause is not
 supported in DELETE`, and the same for LIMIT), where upstream reports only
-`near "ORDER": syntax error`.
+`near "ORDER": syntax error` or `near "LIMIT": syntax error`.
