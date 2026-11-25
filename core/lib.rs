@@ -17,6 +17,8 @@ pub mod busy;
 pub mod cdc;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
+#[cfg(test)]
+mod delete_order_by_limit_tests;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
 pub mod index_method;

@@ -4762,7 +4762,9 @@ impl<'a> Parser<'a> {
         let tbl_name = self.parse_fullname(true)?;
         let indexed = self.parse_indexed()?;
         let where_clause = self.parse_where()?;
+        self.reject_delete_order_by_or_limit()?;
         let returning = self.parse_returning()?;
+        self.reject_delete_order_by_or_limit()?;
         Ok(Stmt::Delete {
             with,
             tbl_name,
@@ -4770,6 +4772,17 @@ impl<'a> Parser<'a> {
             where_clause,
             returning,
         })
+    }
+
+    fn reject_delete_order_by_or_limit(&mut self) -> Result<()> {
+        let (token_text, clause) = match self.peek()? {
+            Some(tok) if tok.token_type == TK_ORDER => ("ORDER", "ORDER BY"),
+            Some(tok) if tok.token_type == TK_LIMIT => ("LIMIT", "LIMIT"),
+            _ => return Ok(()),
+        };
+        Err(Error::Custom(format!(
+            "near \"{token_text}\": syntax error: {clause} clause is not supported in DELETE"
+        )))
     }
 
     fn parse_delete(&mut self) -> Result<Stmt> {
